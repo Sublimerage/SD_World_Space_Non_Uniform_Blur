@@ -37,23 +37,26 @@ FACES = {  # name: (tile col, row, axis, sign, rot90 count, mirrored)
 VIEW = np.array([-1.0, -0.82, -1.0]) / np.linalg.norm([-1.0, -0.82, -1.0])   # towards the camera
 CORNER = -np.ones(3) / np.sqrt(3)       # where the -X, -Y and -Z islands meet (the seams' "Y")
 TEX = 1024                              # texture size of the test sphere
-BASE, WHITE = 0.27, 0.95                # sphere grey (mask 0) and mask white (mask 1)
 SPHERE = 0.94                           # sphere diameter / icon size
 OUT_DIR = os.path.join(ROOT, "docs", "icon")
 ICON_NAME = "world_space_non_uniform_blur"
 
 # the story: spots on an arc across the "Y"; the Blur Map ramps from 0 (left) to 1 (right)
 OPTIONS = {
-    # shape: a fine world-space pattern ('stripes' or 'dots') over the whole sphere;
-    # the Blur Map is a soft round area (off-centre, over the seams): the pattern melts inside it
-    # and stays crisp outside, like depth of field
-    'stripes': dict(shape='stripes', period=0.21, params=dict(samples=16.0, blades=5.0, softness=0.25, intensity=10.0)),
-    'dots': dict(shape='dots', period=0.21, params=dict(samples=16.0, blades=5.0, softness=0.25, intensity=10.0)),
-    'stripes_s6': dict(shape='stripes', period=0.21, params=dict(samples=6.0, blades=5.0, softness=0.0, intensity=10.0)),
+    # the mask is the test sphere's 3D checker (continuous across the seams), drawn in two close greys;
+    # blur 'blob': the Blur Map is a soft round area (the checker melts only there),
+    # blur 'ramp': the Blur Map ramps from 0 (left) to 1 (right)
+    'checker_blob': dict(shape='checker', blur='blob', params=dict(samples=16.0, blades=5.0, softness=0.25, intensity=14.0)),
+    'checker_ramp': dict(shape='checker', blur='ramp', params=dict(samples=16.0, blades=5.0, softness=0.25, intensity=5.0)),
 }
-CHOSEN = 'stripes'
+# render styles: checker greys (mask 0 / mask 1) and seam dashes (grey, width in px at the final size)
+STYLES = {
+    'dark_seams': dict(dark=0.38, light=0.63, seam=0.08, seam_w=1.6),
+    'white_seams': dict(dark=0.36, light=0.60, seam=0.97, seam_w=1.6),
+}
+CHOSEN = ('checker_blob', 'dark_seams')
 BLOB = (0.36, 0.02)        # blur area centre in view coordinates (right, up)
-BLOB_R = (0.20, 0.62)      # blur map: 1 inside the first chord distance, 0 beyond the second
+BLOB_R = (0.10, 0.78)      # blur map: 1 inside the first chord distance, 0 beyond the second
 COMMON = dict(quality=4.0, use_blur_map=True, blur_map_from_input=False, invert_blur_map=False, dither=0.0)
 
 
@@ -109,6 +112,9 @@ def smoothstep(e0, e1, x):
 
 def pattern(pos, shape, period):
     """fine mask pattern defined in 3D (continuous across the seams), anti-aliased."""
+    if shape == 'checker':                              # same 3D checker as the earlier test renders
+        f = np.floor(pos * 3.0 + 100.37).astype(int)
+        return ((f[..., 0] + f[..., 1] + f[..., 2]) % 2).astype(np.float64)
     v, r, u = basis()
     a = (pos @ (r * 0.8 + u * 0.6)) / period          # diagonal in the view
     if shape == 'stripes':
@@ -132,8 +138,9 @@ def effect_texture(opt):
     P = pos[mask > 0.5]; mn, mx = P.min(0), P.max(0)
     position_map = (pos - mn) / (mx - mn).max()                                   # Painter-style [0,1]
     pos4 = np.concatenate([position_map, np.ones(pos.shape[:2] + (1,))], -1).astype(np.float32)
-    m = pattern(pos, opt['shape'], opt['period']).astype(np.float32)
-    bm = blur_area(pos).astype(np.float32)
+    m = pattern(pos, opt['shape'], opt.get('period', 0.2)).astype(np.float32)
+    v, r, u = basis()
+    bm = (blur_area(pos) if opt['blur'] == 'blob' else np.clip((pos @ r + 0.70) / 1.55, 0, 1)).astype(np.float32)
     prm = dict(COMMON, **opt['params'])
     t0 = time.time()
     res = SI.run_graph(os.path.join(ROOT, OUTPUT_NAME), GRAPH_ID + '_grayscale',
@@ -142,7 +149,8 @@ def effect_texture(opt):
     return res['output']
 
 
-def render(tex, res=128, ss=4):
+def render(tex, res=128, ss=4, style=None):
+    st = STYLES[style or CHOSEN[1]]
     R = res * ss; v, r, u = basis()
     c = ((np.arange(R) + 0.5) / R * 2 - 1) / SPHERE; X, Y = np.meshgrid(c, -c)
     rr = X * X + Y * Y; inside = rr < 1; z = np.sqrt(np.clip(1 - rr, 0, 1))
@@ -150,7 +158,7 @@ def render(tex, res=128, ss=4):
     rows, cols = sphere_uv(pts, tex.shape[0])
     m = map_coordinates(tex, [rows, cols], order=1, mode='nearest')
     L = -0.35 * r + 0.55 * u + 0.75 * v; L /= np.linalg.norm(L)
-    g = (BASE + (WHITE - BASE) * m) * (0.72 + 0.28 * np.clip(pts @ L, 0, 1))    # mask, gently shaded
+    g = (st['dark'] + (st['light'] - st['dark']) * m) * (0.72 + 0.28 * np.clip(pts @ L, 0, 1))   # gently shaded
     # UV seams: where the cube face changes, dashed by the distance from the corner
     axis = np.argmax(np.abs(pts), -1)
     face = np.full((R, R), -1); face[inside] = axis * 2 + (pts[np.arange(len(pts)), axis] > 0)
@@ -158,10 +166,10 @@ def render(tex, res=128, ss=4):
     for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
         sh = np.roll(np.roll(face, dy, 0), dx, 1)
         edge |= (face != sh) & (face >= 0) & (sh >= 0)
-    edge = ndimage.binary_dilation(edge, iterations=2)
+    edge = ndimage.binary_dilation(edge, iterations=max(1, int(round(st['seam_w'] * R / res / 2 - 0.5))))
     ang = np.zeros((R, R)); ang[inside] = np.arccos(np.clip(pts @ CORNER, -1, 1))
     seam = (edge & inside & (np.sin(ang * 38.0) > -0.2))[inside]
-    g = np.where(seam, g * 0.35 + 0.62 * 0.65 * (1 - m) + 0.08 * m, g)   # lighter on grey, darker on white
+    g = np.where(seam, st['seam'], g)
     img = np.zeros((R, R)); img[inside] = np.clip(g, 0, 1)
     a = inside.astype(float)
     img = (img * a).reshape(res, ss, res, ss).mean((1, 3)); a = a.reshape(res, ss, res, ss).mean((1, 3))
@@ -192,12 +200,13 @@ def cached_texture(name):
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
     if '--options' in sys.argv:
-        names = [a for a in sys.argv[1:] if a in OPTIONS] or list(OPTIONS)
-        texs = [cached_texture(n) for n in names]
-        sheet([render(t, 512) for t in texs], [render(t, 128) for t in texs]).save(os.path.join(OUT_DIR, 'options.png'))
-        print('wrote docs/icon/options.png:', ', '.join(names))
+        combos = [(t, st) for t in OPTIONS for st in STYLES]
+        texs = {t: cached_texture(t) for t in OPTIONS}
+        sheet([render(texs[t], 512, style=st) for t, st in combos],
+              [render(texs[t], 128, style=st) for t, st in combos]).save(os.path.join(OUT_DIR, 'options.png'))
+        print('wrote docs/icon/options.png:', ', '.join('%s/%s' % c for c in combos))
     else:
-        tex = cached_texture(CHOSEN)
+        tex = cached_texture(CHOSEN[0])
         ico, big = render(tex, 128), render(tex, 512)
         ico.save(os.path.join(OUT_DIR, ICON_NAME + ".png"))
         big.save(os.path.join(OUT_DIR, ICON_NAME + "_512.png"))
