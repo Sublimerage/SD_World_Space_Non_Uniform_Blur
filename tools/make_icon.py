@@ -44,12 +44,16 @@ ICON_NAME = "world_space_non_uniform_blur"
 
 # the story: spots on an arc across the "Y"; the Blur Map ramps from 0 (left) to 1 (right)
 OPTIONS = {
-    # name: spots along the arc, spot radius (chord on the unit sphere), filter parameters
-    'big4_s16': dict(n=4, r=0.10, params=dict(samples=16.0, blades=5.0, softness=0.0, intensity=6.0)),
-    'mid5_s16_soft': dict(n=5, r=0.09, params=dict(samples=16.0, blades=5.0, softness=0.25, intensity=5.0)),
-    'big4_s8': dict(n=4, r=0.10, params=dict(samples=8.0, blades=5.0, softness=0.0, intensity=6.0)),
+    # shape: a fine world-space pattern ('stripes' or 'dots') over the whole sphere;
+    # the Blur Map is a soft round area (off-centre, over the seams): the pattern melts inside it
+    # and stays crisp outside, like depth of field
+    'stripes': dict(shape='stripes', period=0.21, params=dict(samples=16.0, blades=5.0, softness=0.25, intensity=10.0)),
+    'dots': dict(shape='dots', period=0.21, params=dict(samples=16.0, blades=5.0, softness=0.25, intensity=10.0)),
+    'stripes_s6': dict(shape='stripes', period=0.21, params=dict(samples=6.0, blades=5.0, softness=0.0, intensity=10.0)),
 }
-CHOSEN = 'big4_s16'
+CHOSEN = 'stripes'
+BLOB = (0.36, 0.02)        # blur area centre in view coordinates (right, up)
+BLOB_R = (0.20, 0.62)      # blur map: 1 inside the first chord distance, 0 beyond the second
 COMMON = dict(quality=4.0, use_blur_map=True, blur_map_from_input=False, invert_blur_map=False, dither=0.0)
 
 
@@ -90,7 +94,7 @@ def sphere_uv(p, res=512):
     return rows, cols
 
 
-def spot_centres(n):
+def _unused_spot_centres(n):
     """n points on an arc across the seams' "Y", left to right in the view."""
     v, r, u = basis()
     s = np.linspace(0, 1, n)
@@ -98,22 +102,42 @@ def spot_centres(n):
     return c / np.linalg.norm(c, axis=1, keepdims=True)
 
 
+def smoothstep(e0, e1, x):
+    t = np.clip((x - e0) / (e1 - e0), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def pattern(pos, shape, period):
+    """fine mask pattern defined in 3D (continuous across the seams), anti-aliased."""
+    v, r, u = basis()
+    a = (pos @ (r * 0.8 + u * 0.6)) / period          # diagonal in the view
+    if shape == 'stripes':
+        d = np.abs(a - np.floor(a) - 0.5)               # 0 at the stripe centre, 0.5 between
+        return smoothstep(0.24, 0.20, d)
+    b = (pos @ (-r * 0.6 + u * 0.8)) / period
+    da, db = a - np.floor(a) - 0.5, b - np.floor(b) - 0.5
+    return smoothstep(0.30, 0.25, np.sqrt(da * da + db * db))
+
+
+def blur_area(pos):
+    v, r, u = basis()
+    c = v + BLOB[0] * r + BLOB[1] * u
+    c /= np.linalg.norm(c)
+    return smoothstep(BLOB_R[1], BLOB_R[0], np.linalg.norm(pos - c, axis=-1))
+
+
 def effect_texture(opt):
-    """the mask (spots) blurred by the real filter, with a left -> right Blur Map."""
+    """the mask blurred by the real filter (grayscale graph of the .sbs through tools/sbsinterp.py)."""
     pos, mask = make_sphere(TEX)
     P = pos[mask > 0.5]; mn, mx = P.min(0), P.max(0)
     position_map = (pos - mn) / (mx - mn).max()                                   # Painter-style [0,1]
     pos4 = np.concatenate([position_map, np.ones(pos.shape[:2] + (1,))], -1).astype(np.float32)
-    v, r, u = basis()
-    flat = pos.reshape(-1, 3)
-    d = np.min(np.linalg.norm(flat[:, None, :] - spot_centres(opt['n'])[None], axis=-1), 1)
-    spots = (d < opt['r']).reshape(pos.shape[:2]).astype(np.float32)
-    # smooth control field: position across the view, 0 at the first spot -> 1 at the last
-    blur_map = np.clip((pos @ r + 0.62) / 1.30, 0, 1).astype(np.float32)
+    m = pattern(pos, opt['shape'], opt['period']).astype(np.float32)
+    bm = blur_area(pos).astype(np.float32)
     prm = dict(COMMON, **opt['params'])
     t0 = time.time()
     res = SI.run_graph(os.path.join(ROOT, OUTPUT_NAME), GRAPH_ID + '_grayscale',
-                       {'input': spots, 'mesh_position': pos4, 'mesh_uv_mask': mask, 'blur_map': blur_map}, params=prm)
+                       {'input': m, 'mesh_position': pos4, 'mesh_uv_mask': mask, 'blur_map': bm}, params=prm)
     print('filter ran in %.0fs' % (time.time() - t0))
     return res['output']
 
