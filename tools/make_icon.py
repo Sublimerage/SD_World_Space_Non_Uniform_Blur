@@ -1,95 +1,111 @@
 """Generates the filter icon (docs/icon.svg, docs/icon.png).
 
-A five-blade bokeh made of halftone dots that grow from left to right (the
-non-uniform blur amount), split by the dashed seam line used by the other world
-space filters.  The PNG (128x128) is embedded in the .sbs by build_wsnub.py.
+A sphere blurred in world space: most of it is a soft checker drawn as halftone
+dots, while one cap (where the blur map is black) stays a crisp checker.  The
+PNG (128x128) is embedded in the .sbs by build_wsnub.py.
 """
 import math
 import os
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DOCS = os.path.join(os.path.dirname(HERE), 'docs')
 
 SIZE = 128
-CX, CY = 64.0, 68.0
-R_OUT = 56.0                 # pentagon circumradius
-RINGS = 4
-SEAM_X = 64.0
-SEAM_CLEAR = 4.0
+CX, CY, R = 64.0, 64.0, 57.0            # sphere silhouette
+RIM = 2.6                                # outline width
+CAP_X, CAP_Y, CAP_R = 95.0, 39.0, 33.0   # the sharp (unblurred) area
+GAP = 3.5                                # empty band between the dots and the sharp area
+CELL = 12.0                              # checker cell
+DOT_PITCH = 7.0
+ROT = math.radians(-18)                  # checker rotation, to suggest curvature
 
 
-def pentagon(r):
-    return [(CX + r * math.sin(2 * math.pi * k / 5), CY - r * math.cos(2 * math.pi * k / 5)) for k in range(5)]
-
-
-def edge_distance(x, y):
-    """signed distance to the pentagon edges (positive inside)."""
-    pts = pentagon(R_OUT)
-    d = 1e9
-    for k in range(5):
-        (x0, y0), (x1, y1) = pts[k], pts[(k + 1) % 5]
-        nx, ny = y1 - y0, -(x1 - x0)          # outward normal for clockwise points
-        ln = math.hypot(nx, ny)
-        d = min(d, -((x - x0) * nx + (y - y0) * ny) / ln)
-    return d
+def checker_uv(x, y):
+    dx, dy = x - CX, y - CY
+    u = (dx * math.cos(ROT) - dy * math.sin(ROT)) / CELL
+    v = (dx * math.sin(ROT) + dy * math.cos(ROT)) / CELL
+    return u, v
 
 
 def dots():
-    """concentric pentagon rings: bigger towards the centre (bokeh) and towards
-    the right (the blur amount grows across the image)."""
+    """blurred checker as halftone: one dot per checker cell, big on white cells and
+    small on black ones.  The contrast fades away from the sharp cap: the blur gets
+    stronger with distance (non-uniform)."""
     out = []
-    for k in range(1, RINGS + 1):
-        rr = R_OUT * k / RINGS
-        pts = pentagon(rr)
-        per_side = k
-        for e in range(5):
-            (x0, y0), (x1, y1) = pts[e], pts[(e + 1) % 5]
-            for m in range(per_side):
-                t = m / per_side
-                x, y = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
-                if abs(x - SEAM_X) < SEAM_CLEAR:
-                    continue
-                u = min(max((x - (CX - R_OUT)) / (2 * R_OUT), 0.0), 1.0)
-                grow = 0.28 + 0.72 * u ** 0.8
-                ring = 1.0 - 0.55 * (k - 1) / (RINGS - 1)
-                r = 8.2 * grow * ring
-                r = min(r, abs(x - SEAM_X) - 2.25 - 3.0)   # keep a clear gap along the seam
-                if r >= 1.0:
-                    out.append((x, y, r))
+    n = int(R / CELL) + 2
+    for jj in range(-n, n + 1):
+        for ii in range(-n, n + 1):
+            u, v = ii + 0.5, jj + 0.5
+            x = CX + (u * math.cos(ROT) + v * math.sin(ROT)) * CELL
+            y = CY + (-u * math.sin(ROT) + v * math.cos(ROT)) * CELL
+            white = 1.0 if (ii + jj) % 2 == 0 else 0.0
+            dcap = math.hypot(x - CAP_X, y - CAP_Y) - CAP_R
+            contrast = min(max(1.0 - dcap / 70.0, 0.2), 1.0)
+            soft = 0.5 + (white - 0.5) * contrast
+            r = CELL * (0.12 + 0.30 * soft)
+            d = math.hypot(x - CX, y - CY)
+            inside = d + r <= R - RIM - 2.0
+            clear = dcap - r >= GAP
+            if inside and clear and r >= 0.9:
+                out.append((x, y, r))
     return out
 
 
-def dashes():
-    out = []
-    y = 4.0
-    while y < SIZE - 4:
-        out.append((y, min(y + 12.0, SIZE - 4.0)))
-        y += 18.0
-    return out
+def checker_cells():
+    """the white checker cells (unclipped, icon space)."""
+    cells = []
+    for j in range(-8, 9):
+        for i in range(-8, 9):
+            if (i + j) % 2:
+                continue
+            pts = []
+            for a, b in ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)):
+                x = CX + (a * math.cos(ROT) + b * math.sin(ROT)) * CELL
+                y = CY + (-a * math.sin(ROT) + b * math.cos(ROT)) * CELL
+                pts.append((x, y))
+            cells.append(pts)
+    return cells
 
 
 def svg():
-    parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d">' % (SIZE, SIZE, SIZE, SIZE),
-             '<g fill="#ffffff">']
+    p = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d">' % ((SIZE,) * 4),
+         '<defs><clipPath id="sphere"><circle cx="%.1f" cy="%.1f" r="%.1f"/></clipPath>' % (CX, CY, R - RIM - 1.5),
+         '<clipPath id="cap"><circle cx="%.1f" cy="%.1f" r="%.1f"/></clipPath></defs>' % (CAP_X, CAP_Y, CAP_R),
+         '<g fill="#ffffff">',
+         '<circle cx="%.1f" cy="%.1f" r="%.2f" fill="none" stroke="#ffffff" stroke-width="%.1f"/>'
+         % (CX, CY, R - RIM / 2, RIM)]
     for x, y, r in dots():
-        parts.append('<circle cx="%.2f" cy="%.2f" r="%.2f"/>' % (x, y, r))
-    for y0, y1 in dashes():
-        parts.append('<rect x="%.1f" y="%.1f" width="4.5" height="%.1f" rx="2.25"/>' % (SEAM_X - 2.25, y0, y1 - y0))
-    parts.append('</g></svg>')
-    return '\n'.join(parts)
+        p.append('<circle cx="%.2f" cy="%.2f" r="%.2f"/>' % (x, y, r))
+    p.append('<g clip-path="url(#sphere)"><g clip-path="url(#cap)">')
+    for pts in checker_cells():
+        p.append('<polygon points="%s"/>' % ' '.join('%.2f,%.2f' % q for q in pts))
+    p.append('</g></g></g></svg>')
+    return '\n'.join(p)
 
 
 def png(scale=8):
     s = SIZE * scale
-    im = Image.new('L', (s, s), 0)
-    dr = ImageDraw.Draw(im)
+
+    def S(v):
+        return v * scale
+
+    def disc(cx, cy, r):
+        im = Image.new('L', (s, s), 0)
+        ImageDraw.Draw(im).ellipse([S(cx - r), S(cy - r), S(cx + r), S(cy + r)], fill=255)
+        return im
+    base = Image.new('L', (s, s), 0)
+    dr = ImageDraw.Draw(base)
+    dr.ellipse([S(CX - R), S(CY - R), S(CX + R), S(CY + R)], outline=255, width=int(RIM * scale))
     for x, y, r in dots():
-        dr.ellipse([(x - r) * scale, (y - r) * scale, (x + r) * scale, (y + r) * scale], fill=255)
-    for y0, y1 in dashes():
-        dr.rounded_rectangle([(SEAM_X - 2.25) * scale, y0 * scale, (SEAM_X + 2.25) * scale, y1 * scale], radius=2.25 * scale, fill=255)
-    a = im.resize((SIZE, SIZE), Image.LANCZOS)
+        dr.ellipse([S(x - r), S(y - r), S(x + r), S(y + r)], fill=255)
+    chk = Image.new('L', (s, s), 0)
+    dc = ImageDraw.Draw(chk)
+    for pts in checker_cells():
+        dc.polygon([(S(x), S(y)) for x, y in pts], fill=255)
+    chk = ImageChops.multiply(ImageChops.multiply(chk, disc(CX, CY, R - RIM - 1.5)), disc(CAP_X, CAP_Y, CAP_R))
+    a = ImageChops.lighter(base, chk).resize((SIZE, SIZE), Image.LANCZOS)
     out = Image.new('RGBA', (SIZE, SIZE), (255, 255, 255, 0))
     out.putalpha(a)
     return out
