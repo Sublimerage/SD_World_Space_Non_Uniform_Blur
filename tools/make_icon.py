@@ -54,7 +54,7 @@ STYLES = {
     'dark_seams': dict(dark=0.38, light=0.63, seam=0.08, seam_w=1.6),
     'white_seams': dict(dark=0.36, light=0.60, seam=0.97, seam_w=1.6),
 }
-CHOSEN = ('checker_blob', 'dark_seams')
+CHOSEN = ('checker_ramp', 'white_seams')
 BLOB = (0.36, 0.02)        # blur area centre in view coordinates (right, up)
 BLOB_R = (0.10, 0.78)      # blur map: 1 inside the first chord distance, 0 beyond the second
 COMMON = dict(quality=4.0, use_blur_map=True, blur_map_from_input=False, invert_blur_map=False, dither=0.0)
