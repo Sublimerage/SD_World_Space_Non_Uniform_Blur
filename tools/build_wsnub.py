@@ -837,4 +837,8 @@ if __name__ == '__main__':
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                              'world_space_non_uniform_blur.sbs')
     n = build(out)
+    from check_types import check
+    probs = check(out)
+    if probs:
+        raise SystemExit('type check failed:\n' + '\n'.join(probs))
     print('wrote', out, n, 'nodes', os.path.getsize(out) // 1024, 'KB')
