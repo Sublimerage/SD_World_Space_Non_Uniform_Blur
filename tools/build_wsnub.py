@@ -818,17 +818,28 @@ def gui_comments(g, uid):
                    for u, name in g.comments)
 
 
+def icon_xml():
+    """docs/icon.png (made by make_icon.py) in the .sbs icon format: base64(uint32 size + zlib(png))."""
+    import base64, struct, zlib
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'docs', 'icon.png')
+    if not os.path.exists(path):
+        return ''
+    png = open(path, 'rb').read()
+    data = base64.b64encode(struct.pack('>I', len(png)) + zlib.compress(png, 9)).decode()
+    return '<icon><datalength v="%d"/><format v="png"/><strdata v="%s"/></icon>' % (len(png), data)
+
+
 def graph_xml(ident, guid, label, desc, params, primary, out_uid, nodes, gui):
     return ('<graph><identifier v="%s"/><uid v="%d"/>'
             '<graphtype v="filter"/><attributes><label v="%s"/><author v="Doru Bogdan"/>'
             '<authorURL v="https://www.artstation.com/sublime"/><tags v="filter;blur;non uniform;bokeh;world space"/>'
-            '<description v="%s"/></attributes><paraminputs>%s</paraminputs><primaryInput v="%d"/>'
+            '<description v="%s"/>%s</attributes><paraminputs>%s</paraminputs><primaryInput v="%d"/>'
             '<graphOutputs><graphoutput><identifier v="output"/><uid v="%d"/><attributes><label v="Output"/>'
             '</attributes></graphoutput></graphOutputs><compNodes>%s</compNodes><baseParameters/>'
             '<GUIObjects>%s</GUIObjects><options><option><name v="defaultParentSize"/><value v="11x11"/></option>'
             '</options><root><rootOutputs><rootOutput><output v="%d"/><format v="0"/><usertag v=""/></rootOutput>'
             '</rootOutputs></root></graph>'
-            % (ident, guid, esc(label), esc(desc), params, primary, out_uid, ''.join(nodes), gui, out_uid))
+            % (ident, guid, esc(label), esc(desc), icon_xml(), params, primary, out_uid, ''.join(nodes), gui, out_uid))
 
 
 IMAGE_IDS = ['input', 'blur_map', 'mesh_position', 'mesh_uv_mask']
