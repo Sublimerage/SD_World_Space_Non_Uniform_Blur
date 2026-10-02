@@ -41,7 +41,7 @@ if __name__ == '__main__':
     prm = {'quality': 1.0}
     for a in sys.argv[3:]:
         k, v = a.split('=')
-        prm[k] = (v == '1') if k == 'use_blur_map' else float(v)
+        prm[k] = (v == '1') if k in ('use_blur_map', 'blur_map_from_input', 'invert_blur_map') else float(v)
     pos, mask, src, r = run(shape, prm, verbose=True)
     out = r['output']
     np.save(prefix + '.npy', out)

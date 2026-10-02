@@ -312,6 +312,8 @@ def run_graph(path, graph_id, images, params=None, targets=None, keep=None, verb
         if fmtv in (0, 1):
             q = 255.0 if fmtv == 0 else 65535.0
             img = np.round(np.clip(img, 0, 1) * q) / q
+        elif fmtv == 2:
+            img = img.astype(np.float16).astype(np.float32)
         if verbose:
             print('node', uid, W, H, '%.2fs' % (time.time() - t0))
         res[uid] = img.astype(np.float32)

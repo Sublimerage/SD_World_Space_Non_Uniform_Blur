@@ -74,5 +74,9 @@ this package match that file's outputs bit for bit.
 - This was only tested with the interpreter above, not yet inside Substance Designer / Painter.
 - The orientation of the bokeh (Angle, odd Blades) is mirrored on mirrored UV islands, as it is in the 2D filter.
   The Reference Axis can't be projected where the surface faces straight along it, so those spots fall back to the X (or Z) axis.
-- Cost is dominated by the sort and splat (as in the mask blur) plus `N` voxel passes. The unused passes are skipped.
+- Performance: the voxelization (bounds, sort, normals) depends only on the mesh and Quality, so it is computed once.
+  Changing the input or the blur-map options re-runs one splat, and moving any other slider only re-runs the
+  `N` blur passes and the final lookup. Voxel textures are 16-bit float, each tap reads 2 mip levels, and texels
+  with no blur skip the voxel lookup. If it is still too slow, lower **Quality** (3 is about half the work of 4)
+  and apply the filter only to the channels that need it, since Painter runs a filter once per channel.
 - Detail finer than one voxel (1/122 of the mesh size at Quality 4) can't be represented, so very small blurs are a little softer than the 2D filter's.

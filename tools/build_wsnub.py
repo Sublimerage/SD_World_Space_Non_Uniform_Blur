@@ -23,6 +23,7 @@ GRAPH_ID = 'world_space_non_uniform_blur'
 MAX_PASSES = 16
 LEVELS = 5                     # voxel mip levels: 128, 64, 32, 16, 8
 C_DECAY = math.sqrt(-math.log(0.001))   # same decay as the 2D Non-Uniform Blur
+F16 = 2                        # pixel processor format: 16 bits float
 LEFT = (0.28125, 0.53125)      # texel (4,8) of a 16x16 info texture
 RIGHT = (0.78125, 0.53125)     # texel (12,8)
 SAMP = 512                     # surface samples: 512x512
@@ -141,8 +142,9 @@ def prog_density():
     return p, vec(sqrt(amean) * sqrt(isz.x * isz.y), 0.0, 0.0, 1.0)
 
 
-def prog_params():
-    # in0 bbox, in1 density.  left: (blur grid origin, voxel size), right: (grid N, max radius in voxels, 0, 1)
+def prog_grid():
+    # in0 bbox.  left: (blur grid origin, voxel size), right: (grid N, 0, 0, 1).
+    # Depends only on the mesh and Quality, so the splats are not recomputed when the blur sliders move.
     p = Program()
     bb = samplecol(0, LEFT)
     ext = samplecol(0, RIGHT).x
@@ -150,11 +152,15 @@ def prog_params():
     h = ext / (N - 6.0)
     centre = bb.xyz + bb.w * 64.0
     org = centre - h * (N * 0.5)
+    return p, ifelse(POS.x < 0.5, vec(org, h), vec(N, 0.0, 0.0, 1.0))
+
+
+def prog_radius():
+    # in0 bbox, in1 density, in2 grid -> (max blur radius in voxels, 0, 0, 1)
     # 2D units: Intensity 1 = 1/256 of the UV space, at the mesh's average texel density
-    rv = fmax(pf('intensity'), 0.0) / 256.0 * samplecol(1, (0.5, 0.5)).x * bb.w / h
-    left = vec(org, h)
-    right = vec(N, rv, 0.0, 1.0)
-    return p, ifelse(POS.x < 0.5, left, right)
+    p = Program()
+    rv = fmax(pf('intensity'), 0.0) / 256.0 * samplecol(1, (0.5, 0.5)).x * samplecol(0, LEFT).w / samplecol(2, LEFT).w
+    return p, vec(rv, 0.0, 0.0, 1.0)
 
 
 def prog_reps():
@@ -329,7 +335,7 @@ def prog_ranges():
     return p, vec(p.v('s1').x, p.v('s2').x, 0.0, 1.0)
 
 
-def _splat_loop(p, accumulate):
+def _splat_loop(p, accumulate, active=None):
     """Gather all surface samples within one blur voxel of this voxel's centre.
 
     in0 sorted, in1 ranges, in2 reps, in4 params, in5 bbox.
@@ -347,6 +353,8 @@ def _splat_loop(p, accumulate):
     N = samplecol(4, RIGHT).x
     ijk, dims = p.v('ijk'), p.v('dims')
     inside = (ijk.x < N) & (ijk.y < N) & (ijk.z < N)
+    if active is not None:
+        inside = inside & active
     p.set('nc', ifelse(inside, dims.x * dims.y * dims.z, 0.0))
     p.set('se', [0.0, 0.0])
     p.set('hv', 0.0)
@@ -369,24 +377,27 @@ def _splat_loop(p, accumulate):
         p.set('t', ifelse(p.v('hv') > 0.5, p.v('t'), p.v('t') + 1.0))
 
 
+WSCALE = 16.0   # keeps splat weights well inside half-float range
+
+
 def prog_splat_colour():
-    # in0 sorted, in1 ranges, in2 reps, in3 vals, in4 params, in5 bbox, in6 area
-    # -> (sum colour*w, sum w)
+    # in0 sorted, in1 ranges, in2 reps, in3 vals, in4 grid, in5 bbox, in6 area, in7 frame
+    # -> (sum colour*w, sum blur amount*w); sum w is in frame.w.  Empty voxels (frame.w = 0) skip the loop.
     p = Program()
     p.set('acc', [0, 0, 0, 0])
 
     def accumulate(suv, tw):
-        w = samplecol(6, suv).w * tw
-        p.set('acc', p.v('acc') + vec(samplecol(3, suv).xyz * w, w))
-    _splat_loop(p, accumulate)
+        w = samplecol(6, suv).w * tw * WSCALE
+        p.set('acc', p.v('acc') + samplecol(3, suv) * w)
+    _splat_loop(p, accumulate, active=samplecol(7, POS).w > 0.0)
     return p, p.v('acc')
 
 
 def prog_splat_frame():
-    # same inputs -> (unit surface normal xyz, blur amount) of the voxel; 0 if empty
+    # in0 sorted, in1 ranges, in2 reps, in4 grid, in5 bbox, in6 area
+    # -> (unit surface normal xyz, sum w) of the voxel; 0 if empty.  Depends only on the mesh.
     p = Program()
     p.set('wsum', 0.0)
-    p.set('esum', 0.0)
     p.set('nsum', [0, 0, 0])
     p.set('tdia', [0, 0, 0])
     p.set('toff', [0, 0, 0])
@@ -398,8 +409,7 @@ def prog_splat_frame():
             n = ar.xyz
             return n / fmax(sqrt(dot(n, n)), 1e-12)
         w = ar.w * tw
-        p.set('wsum', p.v('wsum') + w)
-        p.set('esum', p.v('esum') + samplecol(3, suv).w * (samplecol(6, suv).w * tw))
+        p.set('wsum', p.v('wsum') + w * WSCALE)
         p.set('nsum', p.v('nsum') + unit() * (samplecol(6, suv).w * tw))
         n = unit()
         p.set('tdia', p.v('tdia') + n * n * (samplecol(6, suv).w * tw))
@@ -419,7 +429,13 @@ def prog_splat_frame():
     nv = p.v('nv')
     nv = ifelse(dot(nv, p.v('nsum')) < 0.0, -nv, nv)
     w = p.v('wsum')
-    return p, ifelse(w > 0.0, vec(nv, p.v('esum') / fmax(w, 1e-12)), lift([0, 0, 0, 0]))
+    return p, ifelse(w > 0.0, vec(nv, w), lift([0, 0, 0, 0]))
+
+
+def prog_v0():
+    # in0 colour splat, in1 frame -> (sum colour*w, sum w): the voxels the passes start from
+    p = Program()
+    return p, vec(samplecol(0, POS).xyz, samplecol(1, POS).w)
 
 
 def pass_count():
@@ -431,15 +447,32 @@ def pass_on(k):
     return (pass_count() > k + 0.5) & (pf('intensity') > 0.0)
 
 
+# mip levels 1..4 are packed side by side in one 1024x512 texture
+QW, QH = 1024, 512
+Q_OX = {1: 0, 2: 512, 3: 768, 4: 832}
+
+
+def q_uv(l, ijk):
+    n, T, W, H = level_layout(l)
+    zr = floor(ijk.z / T)
+    zc = ijk.z - zr * T
+    return (vec(Q_OX[l] + zc * n + ijk.x, zr * n + ijk.y) + 0.5) / vec(QW, QH)
+
+
 def prog_pyramid(l, k):
-    # in0 level l-1 atlas -> level l atlas ([1 3 3 1]/8 filter, stride 2)
-    # only computed when pass k uses fat taps.
+    # in0 level 0 voxels (l = 1) or the previous packed texture (l > 1) -> packed texture with levels 1..l.
+    # Level l is the [1 3 3 1]/8 stride-2 filter of level l-1; lower levels are copied.
+    # Only computed when pass k uses fat taps.
     p = Program()
     n, T, W, H = level_layout(l)
     np_, _, _, _ = level_layout(l - 1)
-    p.set('ijk', pixel_voxel(l))
+    px = floor(POS * vec(QW, QH))
+    loc = px - vec(Q_OX[l], 0.0)
+    tile = floor(loc / n)
+    p.set('ijk', vec(loc - tile * n, tile.y * T + tile.x))
+    inreg = (px.x >= Q_OX[l]) & (px.x < Q_OX[l] + W) & (px.y < H)
     p.set('acc', [0, 0, 0, 0])
-    on = pass_on(k) & (pf('softness') > 0.0)
+    on = pass_on(k) & (pf('softness') > 0.0) & inreg
     p.set('on', ifelse(on, 1.0, 0.0))
     with p.loop('i', 0.0, 72) as L:
         i = p.v('i')
@@ -453,39 +486,62 @@ def prog_pyramid(l, k):
             ifelse(o.y > 0.5, ifelse(o.y < 2.5, 3.0, 1.0), 1.0) * \
             ifelse(o.z > 0.5, ifelse(o.z < 2.5, 3.0, 1.0), 1.0) / 512.0
         inb = (fmin(fmin(src.x, src.y), src.z) >= 0.0) & (fmax(fmax(src.x, src.y), src.z) <= np_ - 1.0)
-        val = samplecol(0, voxel_uv(l - 1, clamp(src, 0.0, np_ - 1.0)))
+        sc = clamp(src, 0.0, np_ - 1.0)
+        val = samplecol(0, voxel_uv(0, sc) if l == 1 else q_uv(l - 1, sc))
         p.set('acc', p.v('acc') + ifelse(inb, val * wv, lift([0, 0, 0, 0])))
         p.set('i', i + 1.0)
-    return p, p.v('acc')
+    if l == 1:
+        return p, ifelse(p.v('on') > 0.5, p.v('acc'), lift([0, 0, 0, 0]))
+    lower = px.x < Q_OX[l]
+    return p, ifelse(p.v('on') > 0.5, p.v('acc'), ifelse(lower, samplecol(0, POS), lift([0, 0, 0, 0])))
 
 
-def trilinear(l, idx, g):
-    """sample level-l atlas (input index idx) at level-0 voxel-centre coords g."""
-    n, T, W, H = level_layout(l)
-    s = 2.0 ** l
-    gl = clamp((g + 0.5) / s - 0.5, 0.0, n - 1.0)
-    i0 = fmin(floor(gl), n - 2.0)
-    f = gl - i0
+def _corners(i0, f, uvf, idx):
     acc = None
     for dz in (0, 1):
         for dy in (0, 1):
             for dx in (0, 1):
                 w = (f.x if dx else 1.0 - f.x) * (f.y if dy else 1.0 - f.y) * (f.z if dz else 1.0 - f.z)
-                v = samplecol(idx, voxel_uv(l, i0 + lift([float(dx), float(dy), float(dz)]))) * w
+                v = samplecol(idx, uvf(i0 + lift([float(dx), float(dy), float(dz)]))) * w
                 acc = v if acc is None else acc + v
     return acc
 
 
-def fat_tap(g, lev):
-    """(sum c*w, sum w) at g, blurred to mip level `lev`.  Coarser levels are
-    rescaled by 2^l so a tap on a flat surface weighs the same at any level."""
-    acc = None
-    for l in range(LEVELS):
-        wl = fmax(1.0 - absv(lev - float(l)), 0.0)
-        idx = 0 if l == 0 else l          # input:0 = level 0, input:l = level l
-        t = ifelse(wl > 0.0, trilinear(l, idx, g) * (wl * 2.0 ** l), lift([0, 0, 0, 0]))
-        acc = t if acc is None else acc + t
-    return acc
+def tri_v(g, idx=0):
+    """trilinear sample of the level-0 voxels at voxel-centre coords g."""
+    gl = clamp(g, 0.0, 127.0)
+    i0 = fmin(floor(gl), 126.0)
+    return _corners(i0, gl - i0, lambda c: voxel_uv(0, c), idx)
+
+
+def pow2_level(l):
+    return ifelse(l < 0.5, 1.0, ifelse(l < 1.5, 2.0, ifelse(l < 2.5, 4.0, ifelse(l < 3.5, 8.0, 16.0))))
+
+
+def tri_q(l, g, idx):
+    """trilinear sample of packed mip level l (1..4, runtime value) at level-0 voxel-centre coords g."""
+    s = pow2_level(l)
+    n = 128.0 / s
+    T = ifelse(l < 2.5, 8.0, 4.0)
+    ox = ifelse(l < 1.5, 0.0, ifelse(l < 2.5, 512.0, ifelse(l < 3.5, 768.0, 832.0)))
+    gl = clamp((g + 0.5) / s - 0.5, 0.0, n - 1.0)
+    i0 = fmin(floor(gl), n - 2.0)
+
+    def uvf(c):
+        zr = floor(c.z / T)
+        zc = c.z - zr * T
+        return (vec(ox + zc * n + c.x, zr * n + c.y) + 0.5) / vec(QW, QH)
+    return _corners(i0, gl - i0, uvf, idx)
+
+
+def fat_tap(g, lev, iv=0, iq=1):
+    """(sum c*w, sum w) at g, blurred to mip level `lev` (0..4): 2 trilinear lookups.
+    Coarser levels are rescaled by 2^l so a tap on a flat surface weighs the same at any level."""
+    l0 = fmin(floor(lev), 3.0)
+    f = lev - l0
+    a = ifelse(l0 < 0.5, tri_v(g, iv), tri_q(fmax(l0, 1.0), g, iq) * pow2_level(l0))
+    b = tri_q(l0 + 1.0, g, iq) * pow2_level(l0 + 1.0)
+    return a * (1.0 - f) + b * f
 
 
 def approx_log2_clamped(x):
@@ -498,20 +554,20 @@ def approx_log2_clamped(x):
 
 
 def prog_pass(k):
-    # in0 voxels (level 0), in1..in4 mip levels 1..4, in5 frame (normal, blur amount), in6 params
+    # in0 voxels (level 0), in1 packed mip levels, in2 frame (normal, w), in3 colour splat (.w = blur*w), in4 radius
     p = Program()
     TWO_PI = 2.0 * math.pi
     S = fmax(pi('samples'), 1.0)
     B = clamp(pi('blades'), 1.0, 9.0)
     p.set('ijk', pixel_voxel(0))
     p.set('V', samplecol(0, POS))
-    fr = samplecol(5, POS)
-    rv = samplecol(6, RIGHT).y
-    p.set('r', rv * fr.w * exp(-2.0 * k * C_DECAY / fmax(pass_count(), 1.0)))
+    eff = samplecol(3, POS).w / fmax(samplecol(2, POS).w, 1e-12)
+    rv = samplecol(4, (0.5, 0.5)).x
+    p.set('r', rv * clamp(eff, 0.0, 1.0) * exp(-2.0 * k * C_DECAY / fmax(pass_count(), 1.0)))
     on = pass_on(k) & (p.v('V').w > 0.0) & (p.v('r') > 0.05)
     p.set('on', ifelse(on, 1.0, 0.0))
     # tangent frame: reference axis projected on the surface
-    n = samplecol(5, POS).xyz
+    n = samplecol(2, POS).xyz
     ax = vec(pf('axis_x'), pf('axis_y'), pf('axis_z'))
     D = ax / fmax(sqrt(dot(ax, ax)), 1e-6)
     D = ifelse(dot(ax, ax) > 1e-8, D, lift([0, 1, 0]))
@@ -520,7 +576,7 @@ def prog_pass(k):
     t1b = alt - n * dot(alt, n)
     t1 = ifelse(dot(t1, t1) > 0.04, t1, t1b)
     p.set('t1', t1 / fmax(sqrt(dot(t1, t1)), 1e-6))
-    p.set('t2', cross(samplecol(5, POS).xyz, p.v('t1')))
+    p.set('t2', cross(samplecol(2, POS).xyz, p.v('t1')))
     # fat-tap mip level from the tap radius
     sig = fmax(pf('softness'), 0.0) * 0.4 * p.v('r')
     p.set('lev', approx_log2_clamped(sig / 0.64))
@@ -562,8 +618,11 @@ def hash12(q):
 
 
 def prog_resolve():
-    # in0 input, in1 position, in2 uv mask, in3 blurred voxels, in4 params, in5 blur map
+    # in0 input, in1 position, in2 uv mask, in3 blurred voxels, in4 grid, in5 blur map, in6 radius
     p = Program()
+    rv = samplecol(6, (0.5, 0.5)).x
+    # texels with no blur (black blur map, outside the UV mask) skip the voxel lookup
+    p.set('al', ifelse(samplelum(2, POS) > 0.5, smoothstep01(rv * blur_amount(0, 5, POS) * 0.5), 0.0))
     prm = samplecol(4, LEFT)
     N = samplecol(4, RIGHT).x
     g = clamp((samplecol(1, POS).xyz - prm.xyz) / prm.w - 0.5, 1.0, N - 2.001)
@@ -580,7 +639,7 @@ def prog_resolve():
     p.set('S', [0, 0, 0, 0])
     with p.loop('i', 0.0, 72) as L:
         i = p.v('i')
-        L.until(i >= 64.0)
+        L.until((i >= 64.0) | (p.v('al') <= 0.0))
         a = fmod(i, 4.0)
         b = fmod(floor(i / 4.0), 4.0)
         c = floor(i / 16.0)
@@ -595,17 +654,14 @@ def prog_resolve():
     S = p.v('S')
     res = S.xyz / fmax(S.w, 1e-12)
     src = samplecol(0, POS)
-    eff = blur_amount(0, 5, POS)
-    rv = samplecol(4, RIGHT).y
-    al = smoothstep01(rv * eff * 0.5)
-    p.set('out', src.xyz + (res - src.xyz) * al)
+    p.set('out', src.xyz + (res - src.xyz) * p.v('al'))
     # dither: triangular noise of +-dither/255, faded out at 0 and 1
     px = floor(POS * SIZE)
     nz = hash12(px) + hash12(px + 17.17) - 1.0
     o = p.v('out')
     fade = clamp(fmin(o, 1.0 - o) * 255.0, 0.0, 1.0)
     dith = clamp(o + fade * (nz * pf('dither') * (1.0 / 255.0)), 0.0, 1.0)
-    ok = (samplelum(2, POS) > 0.5) & (S.w > 1e-12)
+    ok = (p.v('al') > 0.0) & (S.w > 1e-12)
     return p, ifelse(ok, vec(dith, src.w), src)
 
 
@@ -797,7 +853,8 @@ def build_colour(uid):
     n_reps = g.pp('WSNB_Samples', prog_reps(), [n_pos, n_uvm, n_info], (9, 9), x=X + 150, y=500)
     n_area = g.pp('WSNB_Area', prog_area(), [n_pos, n_uvm, n_reps, n_bbox, n_info], (9, 9), x=X + 300, y=500)
     n_den = g.pp('WSNB_Density', prog_density(), [n_area, n_info], (4, 4), x=X + 300, y=700)
-    n_prm = g.pp('WSNB_Grid', prog_params(), [n_bbox, n_den], (4, 4), x=X + 300, y=850)
+    n_prm = g.pp('WSNB_Grid', prog_grid(), [n_bbox], (4, 4), x=X + 300, y=850)
+    n_rad = g.pp('WSNB_Radius', prog_radius(), [n_bbox, n_den, n_prm], (4, 4), x=X + 450, y=850)
     n_vals = g.pp('WSNB_Values', prog_vals(), [n_in, n_pos, n_uvm, n_reps, n_bbox, n_info, n_bm], (9, 9),
                   x=X + 450, y=300)
     n_keys = g.pp('WSNB_Keys', prog_keys(), [n_reps, n_bbox], (9, 9), x=X + 300, y=1000)
@@ -807,16 +864,17 @@ def build_colour(uid):
     n_sorted = prev
     n_rng = g.pp('WSNB_Ranges', prog_ranges(), [n_sorted], atlas_size_log2(0), x=X + 450, y=1700)
     splat_in = [n_sorted, n_rng, n_reps, n_vals, n_prm, n_bbox, n_area]
-    n_col = g.pp('WSNB_Splat', prog_splat_colour(), splat_in, atlas_size_log2(0), x=X + 600, y=500)
-    n_frm = g.pp('WSNB_Frame', prog_splat_frame(), splat_in, atlas_size_log2(0), x=X + 600, y=700)
-    V = n_col
+    A0 = atlas_size_log2(0)
+    n_frm = g.pp('WSNB_Frame', prog_splat_frame(), splat_in, A0, fmt=F16, x=X + 600, y=700)
+    n_col = g.pp('WSNB_Splat', prog_splat_colour(), splat_in + [n_frm], A0, fmt=F16, x=X + 600, y=500)
+    V = g.pp('WSNB_Voxels', prog_v0(), [n_col, n_frm], A0, fmt=F16, x=X + 700, y=500)
     for k in range(MAX_PASSES):
         x0 = X + 800 + 200 * k
-        lv = [V]
+        q = V
         for l in range(1, LEVELS):
-            lv.append(g.pp('WSNB_Mip%d' % l, prog_pyramid(l, k), [lv[-1]], atlas_size_log2(l), x=x0, y=300 + 120 * l))
-        V = g.pp('WSNB_Pass%d' % (k + 1), prog_pass(k), lv + [n_frm, n_prm], atlas_size_log2(0), x=x0 + 100, y=200)
-    n_out = g.pp('WSNB_Resolve', prog_resolve(), [n_in, n_pos, n_uvm, V, n_prm, n_bm], (0, 0), rel=1, fmt=1,
+            q = g.pp('WSNB_Mip%d' % l, prog_pyramid(l, k), [q], (10, 9), fmt=F16, x=x0, y=300 + 120 * l)
+        V = g.pp('WSNB_Pass%d' % (k + 1), prog_pass(k), [V, q, n_frm, n_col, n_rad], A0, fmt=F16, x=x0 + 100, y=200)
+    n_out = g.pp('WSNB_Resolve', prog_resolve(), [n_in, n_pos, n_uvm, V, n_prm, n_bm, n_rad], (0, 0), rel=1, fmt=1,
                  x=X + 800 + 200 * MAX_PASSES + 200, y=0)
     g.output_bridge(n_out, U['output'], X + 800 + 200 * MAX_PASSES + 400, 0)
     desc = ('Non-uniform (bokeh) blur done in 3D using the mesh position, so it is continuous across UV seams. '
