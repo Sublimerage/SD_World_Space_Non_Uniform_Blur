@@ -818,10 +818,10 @@ def gui_comments(g, uid):
                    for u, name in g.comments)
 
 
-def icon_xml():
-    """docs/icon.png (made by make_icon.py) in the .sbs icon format: base64(uint32 size + zlib(png))."""
+def icon_xml(kind):
+    """docs/icon_<kind>.png (made by make_icon.py) in the .sbs icon format: base64(uint32 size + zlib(png))."""
     import base64, struct, zlib
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'docs', 'icon.png')
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'docs', 'icon_%s.png' % kind)
     if not os.path.exists(path):
         return ''
     png = open(path, 'rb').read()
@@ -829,7 +829,7 @@ def icon_xml():
     return '<icon><datalength v="%d"/><format v="png"/><strdata v="%s"/></icon>' % (len(png), data)
 
 
-def graph_xml(ident, guid, label, desc, params, primary, out_uid, nodes, gui):
+def graph_xml(ident, guid, label, desc, params, primary, out_uid, nodes, gui, icon):
     return ('<graph><identifier v="%s"/><uid v="%d"/>'
             '<graphtype v="filter"/><attributes><label v="%s"/><author v="Doru Bogdan"/>'
             '<authorURL v="https://www.artstation.com/sublime"/><tags v="filter;blur;non uniform;bokeh;world space"/>'
@@ -839,7 +839,7 @@ def graph_xml(ident, guid, label, desc, params, primary, out_uid, nodes, gui):
             '<GUIObjects>%s</GUIObjects><options><option><name v="defaultParentSize"/><value v="11x11"/></option>'
             '</options><root><rootOutputs><rootOutput><output v="%d"/><format v="0"/><usertag v=""/></rootOutput>'
             '</rootOutputs></root></graph>'
-            % (ident, guid, esc(label), esc(desc), icon_xml(), params, primary, out_uid, ''.join(nodes), gui, out_uid))
+            % (ident, guid, esc(label), esc(desc), icon_xml(icon), params, primary, out_uid, ''.join(nodes), gui, out_uid))
 
 
 IMAGE_IDS = ['input', 'blur_map', 'mesh_position', 'mesh_uv_mask']
@@ -891,7 +891,7 @@ def build_colour(uid):
     desc = ('Non-uniform (bokeh) blur done in 3D using the mesh position, so it is continuous across UV seams. '
             'The Blur Map scales the blur per texel like the 2D Non-Uniform Blur.')
     return graph_xml(GRAPH_ID, guid, 'World Space Non Uniform Blur', desc, params_xml(U, 1), U['input'],
-                     U['output'], g.nodes, gui_comments(g, uid)), len(g.nodes)
+                     U['output'], g.nodes, gui_comments(g, uid), 'color'), len(g.nodes)
 
 
 def instance_param(uid, name):
@@ -930,7 +930,7 @@ def build_grayscale(uid, pkg_uid):
     g.output_bridge(n_gray, U['output'], 300, 0)
     desc = 'Grayscale version of World Space Non Uniform Blur (for masks).'
     return graph_xml(GRAPH_ID + '_grayscale', guid, 'World Space Non Uniform Blur Grayscale', desc,
-                     params_xml(U, 2), U['input'], U['output'], g.nodes, gui_comments(g, uid))
+                     params_xml(U, 2), U['input'], U['output'], g.nodes, gui_comments(g, uid), 'gray')
 
 
 def build(path):
