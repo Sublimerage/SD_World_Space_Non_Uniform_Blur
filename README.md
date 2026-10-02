@@ -17,7 +17,7 @@ It is built the same way as *World Space Mask Blur*.
 | Input | |
 |---|---|
 | Input | the image to blur |
-| Blur Map | grayscale, scales the blur per texel (white = full Intensity, black = none). Used when **Use Blur Map** is on. |
+| Blur Map | optional grayscale map that scales the blur per texel (white = full Intensity, black = none). Only used when **Use Input As Blur Map** is off. |
 | Mesh Position | the baked position map |
 | Mesh UV Mask | the UV mask (texels outside it are passed through) |
 
@@ -26,11 +26,13 @@ It is built the same way as *World Space Mask Blur*.
 **Blur** (same meaning as the 2D Non-Uniform Blur)
 
 - **Samples** (1–16): the number of blur passes. Each pass averages the centre with `Blades` taps on a polygon, and the radius shrinks from pass to pass, which fills the bokeh shape.
-- **Intensity**: the blur radius, as a percentage of the mesh's largest dimension.
+- **Intensity**: the blur radius, in the same units as the 2D filter (1 = 1/256 of the UV space; default 10). It is converted to world space using the mesh's average texel density, so islands with very different texel density blur by the same world size rather than by the same number of pixels.
 - **Anisotropy**: squashes the shape across the Angle direction (1 = a line).
 - **Blades** (1–9): the number of polygon sides.
 - **Angle**: rotation of the shape around the surface normal.
-- **Use Blur Map**: scale the blur with the Blur Map input. When off, the blur is uniform.
+- **Use Blur Map** (on by default): scale the blur per texel. When off, the blur is uniform.
+- **Use Input As Blur Map** (on by default): use the luminance of the Input itself as the blur map, like plugging the layer below into both inputs of the 2D filter. Turn it off to use the Blur Map input instead.
+- **Invert Blur Map**: blur the dark areas instead of the bright ones.
 
 **World Space**
 
@@ -43,10 +45,14 @@ It is built the same way as *World Space Mask Blur*.
 
 1. **Voxelization** (identical to World Space Mask Blur): bounding box, 512×512 surface samples with area weights, a bitonic sort of the samples into a 128³ hash grid, and per-voxel ranges.
 2. **Splat**: two gather passes build a voxel atlas of `(colour·w, w)` and a frame atlas of `(surface normal, blur amount)`. The normal comes from the dominant eigenvector of the normal tensor, so mirrored UV islands don't cancel out.
-3. **Non-uniform passes** (up to 16): each voxel averages its centre and `Blades` taps. The taps sit on the 2D Non-Uniform Blur's ellipse (same angles, inner rotation, anisotropy and radius decay `exp(-2k·√(-ln 0.001)/Samples)`), placed in the voxel's tangent plane and scaled by the voxel's blur amount. Taps read a 5-level voxel mip pyramid, which is what Softness controls, so taps that leave the surface still find it.
+3. **Non-uniform passes** (up to 16): each voxel averages its centre and `Blades` taps. The taps sit on the 2D Non-Uniform Blur's ellipse (same angles, inner rotation, anisotropy and radius decay `exp(-2k·√(-ln 0.001)/N)` with `N = min(Samples, ⌈Intensity·π⌉)` passes), placed in the voxel's tangent plane and scaled by the voxel's blur amount. Taps read a 5-level voxel mip pyramid, which is what Softness controls, so taps that leave the surface still find it.
 4. **Resolve**: a cubic B-spline lookup at every texel's position. It is blended with the original texel where the local radius is below about 2 voxels, so unblurred areas stay sharp.
 
 ![interpreter renders: sphere with blur map, box with anisotropy, box with 8 samples (top: input, bottom: output)](docs/interpreter_preview.png)
+
+Flat-plane comparison with the 2D Non-Uniform Blur (input used as its own blur map, Intensity 10): input, 2D filter, this filter at Softness 0.25, this filter at Softness 0.
+
+![comparison with the 2D Non-Uniform Blur](docs/match_2d.png)
 
 ## Rebuilding / testing
 
@@ -68,5 +74,5 @@ this package match that file's outputs bit for bit.
 - This was only tested with the interpreter above, not yet inside Substance Designer / Painter.
 - The orientation of the bokeh (Angle, odd Blades) is mirrored on mirrored UV islands, as it is in the 2D filter.
   The Reference Axis can't be projected where the surface faces straight along it, so those spots fall back to the X (or Z) axis.
-- Cost is dominated by the sort and splat (as in the mask blur) plus `Samples` voxel passes. Passes above
-  `Samples` are skipped.
+- Cost is dominated by the sort and splat (as in the mask blur) plus `N` voxel passes. The unused passes are skipped.
+- Detail finer than one voxel (1/122 of the mesh size at Quality 4) can't be represented, so very small blurs are a little softer than the 2D filter's.

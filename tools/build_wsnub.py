@@ -15,7 +15,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sbsgen import (Program, E, lift, vec, floor, sqrt, exp, sin, cos, absv, fmin, fmax, clamp,
+from sbsgen import (Program, E, lift, vec, floor, ceil, sqrt, exp, sin, cos, absv, fmin, fmax, clamp,
                     dot, cross, ifelse, tofloat, get, pf, pi, pb, POS, SIZE, samplecol, samplelum,
                     fmod, UID, dynamic_value, dynamic_expr, T_F1, T_F2, T_F3, T_F4, T_BOOL, T_INT)
 
@@ -111,8 +111,38 @@ def quality_n():
     return ifelse(q < 1.5, 48.0, ifelse(q < 2.5, 64.0, ifelse(q < 3.5, 96.0, 128.0)))
 
 
+def blur_amount(in_idx, map_idx, uv):
+    """per-texel blur scale: 1, the Blur Map input or the luminance of the input itself."""
+    src = samplecol(in_idx, uv)
+    e = ifelse(pb('blur_map_from_input'), dot(src.xyz, lift([0.2126, 0.7152, 0.0722])), samplelum(map_idx, uv))
+    e = clamp(ifelse(pb('invert_blur_map'), 1.0 - e, e), 0.0, 1.0)
+    return ifelse(pb('use_blur_map'), e, 1.0)
+
+
+def prog_density():
+    # in0 area, in1 info -> (hash voxels per UV unit, 0, 0, 1): average texel density of the mesh,
+    # used to give Intensity the same meaning as in the 2D Non-Uniform Blur.
+    p = Program()
+    p.set('asum', 0.0)
+    p.set('acnt', 0.0)
+    with p.loop('i', 0.0, 16392) as L:
+        i = p.v('i')
+        L.until(i >= 16384.0)
+
+        def area():
+            row = floor(i / 128.0)
+            return samplecol(0, (vec(i - row * 128.0, row) * 4.0 + 2.5) / SAMP).w
+        p.set('asum', p.v('asum') + fmax(area(), 0.0))
+        p.set('acnt', p.v('acnt') + ifelse(area() > 0.0, 1.0, 0.0))
+        p.set('i', i + 1.0)
+    isz = samplecol(1, (0.5, 0.5)).xy
+    amean = p.v('asum') / fmax(p.v('acnt'), 1.0)
+    # one input texel covers amean hash voxels^2 and 1/isz of UV space
+    return p, vec(sqrt(amean) * sqrt(isz.x * isz.y), 0.0, 0.0, 1.0)
+
+
 def prog_params():
-    # in0 bbox.  left: (blur grid origin, voxel size), right: (grid N, max radius in voxels, 0, 1)
+    # in0 bbox, in1 density.  left: (blur grid origin, voxel size), right: (grid N, max radius in voxels, 0, 1)
     p = Program()
     bb = samplecol(0, LEFT)
     ext = samplecol(0, RIGHT).x
@@ -120,7 +150,8 @@ def prog_params():
     h = ext / (N - 6.0)
     centre = bb.xyz + bb.w * 64.0
     org = centre - h * (N * 0.5)
-    rv = fmax(pf('intensity'), 0.0) * 0.01 * ext / h
+    # 2D units: Intensity 1 = 1/256 of the UV space, at the mesh's average texel density
+    rv = fmax(pf('intensity'), 0.0) / 256.0 * samplecol(1, (0.5, 0.5)).x * bb.w / h
     left = vec(org, h)
     right = vec(N, rv, 0.0, 1.0)
     return p, ifelse(POS.x < 0.5, left, right)
@@ -225,7 +256,7 @@ def prog_vals():
         def one():
             uv = _subsample(i, cell, isz)
             ok = _near(1, 2, uv, rep, r2) & (rep.w > 0.5)
-            eff = ifelse(pb('use_blur_map'), samplelum(6, uv), 1.0)
+            eff = blur_amount(0, 6, uv)
             return vec(samplecol(0, uv).xyz, eff), ok
         v, ok = one()
         p.set('csum', p.v('csum') + ifelse(ok, v, lift([0, 0, 0, 0])))
@@ -391,8 +422,13 @@ def prog_splat_frame():
     return p, ifelse(w > 0.0, vec(nv, p.v('esum') / fmax(w, 1e-12)), lift([0, 0, 0, 0]))
 
 
+def pass_count():
+    # same as the 2D graph: min(Samples, ceil(Intensity * pi))
+    return fmin(fmax(pi('samples'), 1.0), ceil(fmax(pf('intensity'), 0.0) * math.pi))
+
+
 def pass_on(k):
-    return (pi('samples') > k + 0.5) & (pf('intensity') > 0.0)
+    return (pass_count() > k + 0.5) & (pf('intensity') > 0.0)
 
 
 def prog_pyramid(l, k):
@@ -471,7 +507,7 @@ def prog_pass(k):
     p.set('V', samplecol(0, POS))
     fr = samplecol(5, POS)
     rv = samplecol(6, RIGHT).y
-    p.set('r', rv * fr.w * exp(-2.0 * k * C_DECAY / S))
+    p.set('r', rv * fr.w * exp(-2.0 * k * C_DECAY / fmax(pass_count(), 1.0)))
     on = pass_on(k) & (p.v('V').w > 0.0) & (p.v('r') > 0.05)
     p.set('on', ifelse(on, 1.0, 0.0))
     # tangent frame: reference axis projected on the surface
@@ -559,7 +595,7 @@ def prog_resolve():
     S = p.v('S')
     res = S.xyz / fmax(S.w, 1e-12)
     src = samplecol(0, POS)
-    eff = ifelse(pb('use_blur_map'), samplelum(5, POS), 1.0)
+    eff = blur_amount(0, 5, POS)
     rv = samplecol(4, RIGHT).y
     al = smoothstep01(rv * eff * 0.5)
     p.set('out', src.xyz + (res - src.xyz) * al)
@@ -651,12 +687,13 @@ def param_int(uid, ident, label, desc, default, lo, hi, group=None):
             % (ident, uid, esc(label), esc(desc), default, opts, '<group v="%s"/>' % esc(group) if group else ''))
 
 
-def param_bool(uid, ident, label, desc, default, group=None):
+def param_bool(uid, ident, label, desc, default, group=None, visible=None):
     return ('<paraminput><identifier v="%s"/><uid v="%d"/><attributes><label v="%s"/><description v="%s"/>'
             '</attributes><type v="4"/><defaultValue><constantValueBool v="%d"/></defaultValue>'
-            '<defaultWidget><name v="buttons"/><options>%s</options></defaultWidget>%s</paraminput>'
+            '<defaultWidget><name v="buttons"/><options>%s</options></defaultWidget>%s%s</paraminput>'
             % (ident, uid, esc(label), esc(desc), default, opt('default', default),
-               '<group v="%s"/>' % esc(group) if group else ''))
+               '<group v="%s"/>' % esc(group) if group else '',
+               '<visibleIf v="%s"/>' % esc(visible) if visible else ''))
 
 
 def param_image(uid, ident, label, typ, desc=''):
@@ -667,9 +704,11 @@ def param_image(uid, ident, label, typ, desc=''):
             % (ident, uid, esc(label), '<description v="%s"/>' % esc(desc) if desc else '', typ, default))
 
 
-PARAM_IDS = ['samples', 'intensity', 'anisotropy', 'blades', 'angle', 'use_blur_map', 'softness', 'quality',
+PARAM_IDS = ['samples', 'intensity', 'anisotropy', 'blades', 'angle', 'use_blur_map', 'blur_map_from_input',
+             'invert_blur_map', 'softness', 'quality',
              'axis_x', 'axis_y', 'axis_z', 'dither']
-PARAM_TYPES = {'samples': T_INT, 'blades': T_INT, 'use_blur_map': T_BOOL}
+PARAM_TYPES = {'samples': T_INT, 'blades': T_INT, 'use_blur_map': T_BOOL, 'blur_map_from_input': T_BOOL,
+               'invert_blur_map': T_BOOL}
 
 
 def params_xml(U, input_type):
@@ -680,14 +719,15 @@ def params_xml(U, input_type):
         param_image(U['input'], 'input', 'Input', input_type),
         param_image(U['blur_map'], 'blur_map', 'Blur Map', 2,
                     'Grayscale map that scales the blur: white = full Intensity, black = no blur. '
-                    'Enable "Use Blur Map" to use it.'),
+                    'Used when "Use Blur Map" is on and "Use Input As Blur Map" is off.'),
         param_image(U['mesh_position'], 'mesh_position', 'Mesh Position', 1),
         param_image(U['mesh_uv_mask'], 'mesh_uv_mask', 'Mesh UV Mask', 2),
         param_int(U['samples'], 'samples', 'Samples',
                   'Number of blur passes. More passes fill the bokeh shape more smoothly (and cost more).',
                   4, 1, 16, BLUR),
         param_float(U['intensity'], 'intensity', 'Intensity',
-                    'Blur radius, in percent of the largest dimension of the mesh.', 5, 0, 50, 0.01, BLUR),
+                    'Blur radius, in the same units as the 2D Non-Uniform Blur (1 = 1/256 of the UV space), '
+                    'converted to world space with the average texel density of the mesh.', 10, 0, 50, 0.01, BLUR),
         param_float(U['anisotropy'], 'anisotropy', 'Anisotropy',
                     'Squashes the blur shape across the Angle direction (1 = a line).', 0, 0, 1, 0.01, BLUR),
         param_int(U['blades'], 'blades', 'Blades', 'Number of sides of the bokeh shape.', 5, 1, 9, BLUR),
@@ -695,7 +735,12 @@ def params_xml(U, input_type):
                     'Rotation of the blur shape around the surface normal, measured from the Reference Axis.',
                     0, 0, 1, None, BLUR, widget='angle'),
         param_bool(U['use_blur_map'], 'use_blur_map', 'Use Blur Map',
-                   'Scale the blur with the Blur Map input (off = uniform blur).', 0, BLUR),
+                   'Scale the blur per texel (off = uniform blur).', 1, BLUR),
+        param_bool(U['blur_map_from_input'], 'blur_map_from_input', 'Use Input As Blur Map',
+                   'Use the luminance of the Input itself as the blur map, so no extra texture is needed.', 1, BLUR,
+                   visible='input["use_blur_map"]'),
+        param_bool(U['invert_blur_map'], 'invert_blur_map', 'Invert Blur Map',
+                   'Blur the dark areas instead of the bright ones.', 0, BLUR, visible='input["use_blur_map"]'),
         param_float(U['softness'], 'softness', 'Softness',
                     'Blurs each tap of the bokeh. Higher values are smoother and wrap better around hard '
                     'edges and curved areas; 0 keeps the sharpest bokeh shape.', 0.25, 0, 1, 0.01, WS),
@@ -749,9 +794,10 @@ def build_colour(uid):
     X = -1400
     n_info = g.pp('WSNB_Size', prog_info(), [n_pos], (-4, -4), rel=1, x=X, y=800)
     n_bbox = g.pp('WSNB_Bounds', prog_bbox(), [n_pos, n_uvm, n_info], (4, 4), x=X + 150, y=700)
-    n_prm = g.pp('WSNB_Grid', prog_params(), [n_bbox], (4, 4), x=X + 300, y=850)
     n_reps = g.pp('WSNB_Samples', prog_reps(), [n_pos, n_uvm, n_info], (9, 9), x=X + 150, y=500)
     n_area = g.pp('WSNB_Area', prog_area(), [n_pos, n_uvm, n_reps, n_bbox, n_info], (9, 9), x=X + 300, y=500)
+    n_den = g.pp('WSNB_Density', prog_density(), [n_area, n_info], (4, 4), x=X + 300, y=700)
+    n_prm = g.pp('WSNB_Grid', prog_params(), [n_bbox, n_den], (4, 4), x=X + 300, y=850)
     n_vals = g.pp('WSNB_Values', prog_vals(), [n_in, n_pos, n_uvm, n_reps, n_bbox, n_info, n_bm], (9, 9),
                   x=X + 450, y=300)
     n_keys = g.pp('WSNB_Keys', prog_keys(), [n_reps, n_bbox], (9, 9), x=X + 300, y=1000)
