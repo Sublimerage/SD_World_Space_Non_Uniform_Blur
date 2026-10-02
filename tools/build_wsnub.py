@@ -1,4 +1,6 @@
-"""Generates world_space_non_uniform_blur.sbs.
+"""Generates world_space_non_uniform_blur_v<VERSION>.sbs.
+
+Bump VERSION below for each release; it goes in the file name and the graph descriptions.
 
 World space version of the Non-Uniform Blur: the mesh is voxelized (same
 bounding box / sample sort / gather splat as world_space_mask_blur), the
@@ -19,7 +21,9 @@ from sbsgen import (Program, E, lift, vec, floor, ceil, sqrt, exp, sin, cos, abs
                     dot, cross, ifelse, tofloat, get, pf, pi, pb, POS, SIZE, samplecol, samplelum,
                     fmod, UID, dynamic_value, dynamic_expr, T_F1, T_F2, T_F3, T_F4, T_BOOL, T_INT)
 
+VERSION = '1.0'
 GRAPH_ID = 'world_space_non_uniform_blur'
+OUTPUT_NAME = '%s_v%s.sbs' % (GRAPH_ID, VERSION)
 MAX_PASSES = 16
 LEVELS = 5                     # voxel mip levels: 128, 64, 32, 16, 8
 C_DECAY = math.sqrt(-math.log(0.001))   # same decay as the 2D Non-Uniform Blur
@@ -818,10 +822,11 @@ def gui_comments(g, uid):
                    for u, name in g.comments)
 
 
-def icon_xml(kind):
-    """docs/icon_<kind>.png (made by make_icon.py) in the .sbs icon format: base64(uint32 size + zlib(png))."""
+def icon_xml():
+    """docs/icon/world_space_non_uniform_blur.png (made by make_icon.py) in the .sbs icon format:
+    base64(uint32 big-endian size + zlib(png))."""
     import base64, struct, zlib
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'docs', 'icon_%s.png' % kind)
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'docs', 'icon', GRAPH_ID + '.png')
     if not os.path.exists(path):
         return ''
     png = open(path, 'rb').read()
@@ -829,7 +834,7 @@ def icon_xml(kind):
     return '<icon><datalength v="%d"/><format v="png"/><strdata v="%s"/></icon>' % (len(png), data)
 
 
-def graph_xml(ident, guid, label, desc, params, primary, out_uid, nodes, gui, icon):
+def graph_xml(ident, guid, label, desc, params, primary, out_uid, nodes, gui):
     return ('<graph><identifier v="%s"/><uid v="%d"/>'
             '<graphtype v="filter"/><attributes><label v="%s"/><author v="Doru Bogdan"/>'
             '<authorURL v="https://www.artstation.com/sublime"/><tags v="filter;blur;non uniform;bokeh;world space"/>'
@@ -839,7 +844,7 @@ def graph_xml(ident, guid, label, desc, params, primary, out_uid, nodes, gui, ic
             '<GUIObjects>%s</GUIObjects><options><option><name v="defaultParentSize"/><value v="11x11"/></option>'
             '</options><root><rootOutputs><rootOutput><output v="%d"/><format v="0"/><usertag v=""/></rootOutput>'
             '</rootOutputs></root></graph>'
-            % (ident, guid, esc(label), esc(desc), icon_xml(icon), params, primary, out_uid, ''.join(nodes), gui, out_uid))
+            % (ident, guid, esc(label), esc(desc), icon_xml(), params, primary, out_uid, ''.join(nodes), gui, out_uid))
 
 
 IMAGE_IDS = ['input', 'blur_map', 'mesh_position', 'mesh_uv_mask']
@@ -888,10 +893,10 @@ def build_colour(uid):
     n_out = g.pp('WSNB_Resolve', prog_resolve(), [n_in, n_pos, n_uvm, V, n_prm, n_bm, n_rad], (0, 0), rel=1, fmt=1,
                  x=X + 800 + 200 * MAX_PASSES + 200, y=0)
     g.output_bridge(n_out, U['output'], X + 800 + 200 * MAX_PASSES + 400, 0)
-    desc = ('Non-uniform (bokeh) blur done in 3D using the mesh position, so it is continuous across UV seams. '
+    desc = ('v' + VERSION + ' - Non-uniform (bokeh) blur done in 3D using the mesh position, so it is continuous across UV seams. '
             'The Blur Map scales the blur per texel like the 2D Non-Uniform Blur.')
     return graph_xml(GRAPH_ID, guid, 'World Space Non Uniform Blur', desc, params_xml(U, 1), U['input'],
-                     U['output'], g.nodes, gui_comments(g, uid), 'color'), len(g.nodes)
+                     U['output'], g.nodes, gui_comments(g, uid)), len(g.nodes)
 
 
 def instance_param(uid, name):
@@ -928,9 +933,9 @@ def build_grayscale(uid, pkg_uid):
     p = Program()
     n_gray = g.pp('WSNB_ToGray', (p, samplecol(0, POS).x), [u], (0, 0), rel=1, fmt=1, colour=False, x=100, y=0)
     g.output_bridge(n_gray, U['output'], 300, 0)
-    desc = 'Grayscale version of World Space Non Uniform Blur (for masks).'
+    desc = 'v' + VERSION + ' - Grayscale version of World Space Non Uniform Blur (for masks).'
     return graph_xml(GRAPH_ID + '_grayscale', guid, 'World Space Non Uniform Blur Grayscale', desc,
-                     params_xml(U, 2), U['input'], U['output'], g.nodes, gui_comments(g, uid), 'gray')
+                     params_xml(U, 2), U['input'], U['output'], g.nodes, gui_comments(g, uid))
 
 
 def build(path):
@@ -950,7 +955,7 @@ def build(path):
 
 if __name__ == '__main__':
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                             'world_space_non_uniform_blur.sbs')
+                                                             OUTPUT_NAME)
     n = build(out)
     from check_types import check
     probs = check(out)

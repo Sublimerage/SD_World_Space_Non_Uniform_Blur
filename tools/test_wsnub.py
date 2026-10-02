@@ -14,7 +14,8 @@ sys.path.insert(0, HERE)
 import sbsinterp as SI
 import testmesh as T
 
-SBS = os.path.join(os.path.dirname(HERE), 'world_space_non_uniform_blur.sbs')
+from build_wsnub import OUTPUT_NAME
+SBS = os.path.join(os.path.dirname(HERE), OUTPUT_NAME)
 
 
 def run(shape="sphere", params=None, res=512, effect=None, verbose=False, sbs=SBS, keep=None, targets=None):
