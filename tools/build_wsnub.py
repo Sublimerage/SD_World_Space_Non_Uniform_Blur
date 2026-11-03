@@ -2,13 +2,23 @@
 
 Bump VERSION below for each release; it goes in the file name and the graph descriptions.
 
-World space version of the Non-Uniform Blur: the mesh is voxelized (same
-bounding box / sample sort / gather splat as world_space_mask_blur), the
-Non-Uniform Blur passes (Samples x Blades taps on a rotated, anisotropic
-polygon, radius decaying per pass, scaled by the blur map) run in 3D on the
-voxel grid, in each voxel's tangent plane, and the result is read back at
-every texel's mesh position.  Seams no longer show because neighbouring
-islands share the same voxels.
+World space version of the Non-Uniform Blur. The mesh is voxelized exactly
+like World Space Mask Blur v2.0, whose passes are reused from tools/wsb/
+(vendored, unmodified):
+  surface samples -> coarse grid -> boxes around the pieces (slabs along X,
+  runs along Z or Y) -> one sort grid and one voxel grid per box, all packed in
+  linear tables with a shared cell size -> samples sorted per box.
+On top of that, this filter:
+  * splats the surface normals (mesh only) and the input colour / blur amount
+    into each box's voxel grid, with sample areas relative to the mean sample
+    area (so nothing depends on the mesh's size or units);
+  * runs the Non-Uniform Blur passes (Samples x Blades taps on a rotated,
+    anisotropic polygon, radius decaying per pass, scaled by the blur amount)
+    in each voxel's tangent plane. Taps read a per-box mip pyramid (Softness)
+    and stay inside their box: a tap that leaves it reads empty;
+  * reads the result back at every texel's 3D position (cubic B-spline in the
+    texel's box).
+Pieces in different boxes never blur into each other.
 
 Run:  python3 tools/build_wsnub.py  [output.sbs]
 """
@@ -16,57 +26,98 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sbsgen import (Program, E, lift, vec, floor, ceil, sqrt, exp, sin, cos, absv, fmin, fmax, clamp,
-                    dot, cross, ifelse, tofloat, get, pf, pi, pb, POS, SIZE, samplecol, samplelum,
-                    fmod, UID, dynamic_value, dynamic_expr, T_F1, T_F2, T_F3, T_F4, T_BOOL, T_INT)
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, 'wsb'))
+sys.path.insert(0, HERE)
+import world_space_blur as ref  # noqa: E402
+import build_sbs as B  # noqa: E402
+from build_sbs import (Ex, Var, Program, const, lift, vec, fmin, fmax, clamp, floor, fexp, dot, lt, le, gt,  # noqa: E402
+                       ge, land, lor, fsqrt, select, get, pos, param, get_bool, sample_col, sample_lum,
+                       frame_a, fceil, fabs, flag, on, input_size, snap, index_uv, lin_dims, lin_uv, box_uv, lin3,
+                       atlas_uv, box_of, bspline_weights, hash12, my_index, my_grid2, F1, F2, F3, F4, BOOL, FMT_16,
+                       FMT_16F, new_uid)
 
-VERSION = '1.0'
+class DedupEmitter(B.FunctionEmitter):
+    """B.FunctionEmitter that also merges structurally identical expression nodes. It only
+    merges inside one emit() call (one statement, condition or result), so it keeps the
+    vendored emitter's rule that statements and the loop's init / condition / body never
+    share nodes; within one statement every Get reads the same variable values anyway."""
+
+    def emit(self, ex, cache, depth=0):
+        keys = cache.setdefault('__keys__', {})      # id(Ex) -> structure number
+        intern = cache.setdefault('__intern__', {})  # (op, type, data, children's numbers) -> number
+        uids = cache.setdefault('__uids__', {})      # structure number -> emitted uid
+
+        def key(e):
+            k = keys.get(id(e))
+            if k is None:
+                sig = (e.op, e.typ, e.data, tuple(sorted((p_, key(src)) for p_, src in e.inputs.items())))
+                k = intern.setdefault(sig, len(intern))
+                keys[id(e)] = k
+            return k
+
+        def go(e, d):
+            k = key(e)
+            if k in uids:
+                return uids[k]
+            conns = [(port, go(src, d + 1)) for port, src in e.inputs.items()]
+            uid = new_uid()
+            self.nodes.append([uid, e.op, e.typ, conns, e.data, d])
+            uids[k] = uid
+            return uid
+        return go(ex, depth)
+
+
+B.FunctionEmitter = DedupEmitter      # used by B.Graph.pixel_processor
+
+VERSION = '2.0'
 GRAPH_ID = 'world_space_non_uniform_blur'
 OUTPUT_NAME = '%s_v%s.sbs' % (GRAPH_ID, VERSION)
+TAGS = 'filter;blur;non uniform;bokeh;world space'
 MAX_PASSES = 16
-LEVELS = 5                     # voxel mip levels: 128, 64, 32, 16, 8
-C_DECAY = math.sqrt(-math.log(0.001))   # same decay as the 2D Non-Uniform Blur
-F16 = 2                        # pixel processor format: 16 bits float
-LEFT = (0.28125, 0.53125)      # texel (4,8) of a 16x16 info texture
-RIGHT = (0.78125, 0.53125)     # texel (12,8)
-SAMP = 512                     # surface samples: 512x512
-HASH = 128                     # hash grid resolution (fixed)
+LEVELS = 5                               # voxel mip levels 0..4 per box (0 = the voxel grid itself)
+C_DECAY = math.sqrt(-math.log(0.001))    # same pass decay as the 2D Non-Uniform Blur
+T_INT = 16
 
 
 # ----------------------------------------------------------------------------
-# voxel atlas layouts: level l stores (128>>l)^3 voxels as z-slices in tiles
-def level_layout(l):
-    n = 128 >> l
-    tiles = {0: 16, 1: 8, 2: 8, 3: 4, 4: 4}[l]
-    rows = n // tiles
-    return n, tiles, tiles * n, rows * n            # n, tiles per row, W, H
+# table sizes (derived from the reference constants, so reduced test sizes work)
+
+def log2(n):
+    return n.bit_length() - 1
 
 
-def atlas_size_log2(l):
-    n, t, W, H = level_layout(l)
-    return int(math.log2(W)), int(math.log2(H))
+def mip_layout():
+    """Mip levels 1..4 of every box, packed in one linear QW x QH table: level l
+    starts at bases[l]. Capacities hold the worst case of boxes at least 5 voxels
+    wide (2 x MARGIN + 1) filling the whole voxel budget AW * AH at level 0, plus
+    one entry per box per level."""
+    n0 = ref.AW * ref.AH
+    nb = ref.S_MAX * ref.R_MAX
+    worst = {1: 0.22, 2: 0.066, 3: 0.012, 4: 0.009}     # max over n >= 5 of ceil(n / 2^l)^3 / n^3
+    bases, acc = {}, 0
+    for l in range(1, LEVELS):
+        bases[l] = acc
+        acc += int(worst[l] * n0) + nb + 64
+    bases[LEVELS] = acc
+    w, h = lin_dims(1 << (acc - 1).bit_length())
+    return bases, w, h
 
 
-def voxel_uv(l, ijk):
-    """ijk: float3 integer voxel coords at level l -> texel-centre uv."""
-    n, T, W, H = level_layout(l)
-    zr = floor(ijk.z / T)
-    zc = ijk.z - zr * T
-    return (vec(zc * n + ijk.x, zr * n + ijk.y) + 0.5) / vec(W, H)
+# ----------------------------------------------------------------------------
+# small DSL additions
+
+def fsin(v): return Ex('sin', F1, {'a': lift(v)})
+def fcos(v): return Ex('cos', F1, {'a': lift(v)})
 
 
-def pixel_voxel(l):
-    """voxel coords of the current output texel of a level-l atlas."""
-    n, T, W, H = level_layout(l)
-    px = floor(POS * vec(W, H))
-    tile = floor(px / n)
-    return vec(px - tile * n, tile.y * T + tile.x)
+def iparam(name):
+    """integer graph parameter, as a float"""
+    return Ex('tofloat', F1, {'value': Ex('get_integer1', T_INT, data=('constantValueString', name))})
 
 
-def idx_uv(i, size=SAMP):
-    row = floor(i / size)
-    return (vec(i - size * row, row) + 0.5) / size
+def cross3(a, b):
+    return a[1, 2, 0] * b[2, 0, 1] - a[2, 0, 1] * b[1, 2, 0]
 
 
 def smoothstep01(x):
@@ -74,650 +125,547 @@ def smoothstep01(x):
     return x * x * (3.0 - x * 2.0)
 
 
-# ----------------------------------------------------------------------------
-# pixel processor programs.  Input indices are documented per node.
-
-def prog_info():
-    # in0 mesh position.  16x16 (input/16): stores the position map size.
-    p = Program()
-    return p, vec(SIZE * 16.0, 0.0, 1.0)
+def chan(v4, l):
+    """component l - 1 of a float4 (l = 1..4, runtime value)"""
+    return select(lt(l, 1.5), v4.x, select(lt(l, 2.5), v4.y, select(lt(l, 3.5), v4.z, v4.w)))
 
 
-def prog_bbox():
-    # in0 position, in1 uv mask, in2 info -> left: (hash grid origin, hash voxel), right: (extent,0,0,1)
-    p = Program()
-    p.set('isz', samplecol(2, (0.5, 0.5)).xy)
-    p.set('mn', [1e20] * 3)
-    p.set('mx', [-1e20] * 3)
-    with p.loop('i', 0.0, 16392) as L:
-        i = p.v('i')
-        L.until(i >= 16384.0)
-        isz = p.v('isz')
-
-        def uv():
-            row = floor(i / 128.0)
-            return (floor(((vec(i - row * 128.0, row) + 0.47) / 128.0) * isz) + 0.5) / isz
-        u = uv()
-        p.set('mn', fmin(p.v('mn'), ifelse(samplelum(1, u) > 0.99, samplecol(0, u).xyz, lift([1e20] * 3))))
-        u = uv()
-        p.set('mx', fmax(p.v('mx'), ifelse(samplelum(1, u) > 0.99, samplecol(0, u).xyz, lift([-1e20] * 3))))
-        p.set('i', i + 1.0)
-    mn, mx = p.v('mn'), p.v('mx')
-    d = mx - mn
-    ext = fmax(fmax(fmax(d.x, d.y), d.z), 1e-8)
-    hf = ext / 124.0
-    left = vec((mn + mx) * 0.5 - hf * 64.0, hf)
-    right = vec(ext, 0.0, 0.0, 1.0)
-    return p, ifelse(POS.x < 0.5, left, right)
+def pow2(l):
+    """2^l for l = 0..4 (runtime value)"""
+    return select(lt(l, 0.5), 1.0, select(lt(l, 1.5), 2.0, select(lt(l, 2.5), 4.0, select(lt(l, 3.5), 8.0, 16.0))))
 
 
-def quality_n():
-    q = clamp(floor(pf('quality') + 0.5), 1.0, 4.0)
-    return ifelse(q < 1.5, 48.0, ifelse(q < 2.5, 64.0, ifelse(q < 3.5, 96.0, 128.0)))
+def inside3(c, n):
+    """all components of integer coords c in [0, n - 1]"""
+    return land(ge(fmin(fmin(c.x, c.y), c.z), 0.0), le(fmax(fmax(c.x - n.x, c.y - n.y), c.z - n.z), -1.0))
 
 
-def blur_amount(in_idx, map_idx, uv):
-    """per-texel blur scale: 1, the Blur Map input or the luminance of the input itself."""
-    src = samplecol(in_idx, uv)
-    e = ifelse(pb('blur_map_from_input'), dot(src.xyz, lift([0.2126, 0.7152, 0.0722])), samplelum(map_idx, uv))
-    e = clamp(ifelse(pb('invert_blur_map'), 1.0 - e, e), 0.0, 1.0)
-    return ifelse(pb('use_blur_map'), e, 1.0)
+def box_table2(slot, b):
+    """entry of box b in an R_MAX x S_MAX table (WSNB_MipBoxes)"""
+    R, S = ref.R_MAX, ref.S_MAX
+    s = floor(lift(b) / float(R))
+    return sample_col(slot, B.grid2_uv(lift(b) - s * float(R), s, R, S))
 
 
-def prog_density():
-    # in0 area, in1 info -> (hash voxels per UV unit, 0, 0, 1): average texel density of the mesh,
-    # used to give Intensity the same meaning as in the 2D Non-Uniform Blur.
-    p = Program()
-    p.set('asum', 0.0)
-    p.set('acnt', 0.0)
-    with p.loop('i', 0.0, 16392) as L:
-        i = p.v('i')
-        L.until(i >= 16384.0)
-
-        def area():
-            row = floor(i / 128.0)
-            return samplecol(0, (vec(i - row * 128.0, row) * 4.0 + 2.5) / SAMP).w
-        p.set('asum', p.v('asum') + fmax(area(), 0.0))
-        p.set('acnt', p.v('acnt') + ifelse(area() > 0.0, 1.0, 0.0))
-        p.set('i', i + 1.0)
-    isz = samplecol(1, (0.5, 0.5)).xy
-    amean = p.v('asum') / fmax(p.v('acnt'), 1.0)
-    # one input texel covers amean hash voxels^2 and 1/isz of UV space
-    return p, vec(sqrt(amean) * sqrt(isz.x * isz.y), 0.0, 0.0, 1.0)
+def box_dims(slot_vb, b):
+    """right half of a grid table: (dims.xyz, valid)"""
+    return sample_col(slot_vb, box_uv(b, 1.0))
 
 
-def prog_grid():
-    # in0 bbox.  left: (blur grid origin, voxel size), right: (grid N, 0, 0, 1).
-    # Depends only on the mesh and Quality, so the splats are not recomputed when the blur sliders move.
-    p = Program()
-    bb = samplecol(0, LEFT)
-    ext = samplecol(0, RIGHT).x
-    N = quality_n()
-    h = ext / (N - 6.0)
-    centre = bb.xyz + bb.w * 64.0
-    org = centre - h * (N * 0.5)
-    return p, ifelse(POS.x < 0.5, vec(org, h), vec(N, 0.0, 0.0, 1.0))
-
-
-def prog_radius():
-    # in0 bbox, in1 density, in2 grid -> (max blur radius in voxels, 0, 0, 1)
-    # 2D units: Intensity 1 = 1/256 of the UV space, at the mesh's average texel density
-    p = Program()
-    rv = fmax(pf('intensity'), 0.0) / 256.0 * samplecol(1, (0.5, 0.5)).x * samplecol(0, LEFT).w / samplecol(2, LEFT).w
-    return p, vec(rv, 0.0, 0.0, 1.0)
-
-
-def prog_reps():
-    # in0 position, in1 uv mask, in2 info -> per 512 cell: (valid position of the cell, 1) or 0
-    p = Program()
-    isz = p.set('isz', samplecol(2, (0.5, 0.5)).xy)
-    p.set('cell', floor(POS * SAMP))
-    p.set('bestUV', (floor(POS * SAMP) + 0.5) / SAMP)
-    p.set('bestD', 1e20)
-    with p.loop('i', 0.0, 24) as L:
-        i = p.v('i')
-        L.until(i >= 16.0)
-        cell, isz = p.v('cell'), p.v('isz')
-
-        def sub():
-            row = floor(i / 4.0)
-            s = (cell + (vec(i - row * 4.0, row) + 0.47) / 4.0) / SAMP
-            d = s - (cell + 0.5) / SAMP
-            ok = samplelum(1, (floor(s * isz) + 0.5) / isz) > 0.99
-            return s, dot(d, d), ok
-        s, dd, ok = sub()
-        p.set('bestUV', ifelse(ok & (dd < p.v('bestD')), s, p.v('bestUV')))
-        s, dd, ok = sub()
-        p.set('bestD', ifelse(ok & (dd < p.v('bestD')), dd, p.v('bestD')))
-        p.set('i', i + 1.0)
-    found = p.v('bestD') < 1e19
-    uv = (floor(p.v('bestUV') * p.v('isz')) + 0.5) / p.v('isz')
-    return p, vec(ifelse(found, samplecol(0, uv).xyz, lift([0, 0, 0])), ifelse(found, 1.0, 0.0))
-
-
-def _subsample(i, cell, isz):
-    row = floor(i / 4.0)
-    return (floor(((cell + (vec(i - row * 4.0, row) + 0.47) / 4.0) / SAMP) * isz) + 0.5) / isz
-
-
-def _near(pos_idx, mask_idx, uv, rep, r2):
-    d = samplecol(pos_idx, uv).xyz - rep.xyz
-    return (samplelum(mask_idx, uv) > 0.99) & (dot(d, d) < r2)
-
-
-def prog_area():
-    # in0 position, in1 uv mask, in2 reps, in3 bbox, in4 info
-    # -> (surface area around the sample, area weighted normal xyz), in hash voxel^2 units
-    p = Program()
-    p.set('isz', samplecol(4, (0.5, 0.5)).xy)
-    p.set('cell', floor(POS * SAMP))
-    p.set('rep', samplecol(2, (floor(POS * SAMP) + 0.5) / SAMP))
-    hf = samplecol(3, LEFT).w
-    p.set('r2', (hf * 2.0) * (hf * 2.0))
-    p.set('a', 0.0)
-    p.set('nrm', [0, 0, 0])
-    with p.loop('i', 0.0, 24) as L:
-        i = p.v('i')
-        L.until(i >= 16.0)
-        isz, cell, rep, r2 = p.v('isz'), p.v('cell'), p.v('rep'), p.v('r2')
-
-        def crossv():
-            uv = _subsample(i, cell, isz)
-            c = samplecol(0, uv).xyz
-
-            def side(du):
-                up, dn = uv + du, uv - du
-                dup = samplecol(0, up).xyz - c
-                ddn = c - samplecol(0, dn).xyz
-                inb = lambda q: (fmin(q.x, q.y) > 0.0) & (fmax(q.x, q.y) < 1.0)
-                okup = (samplelum(1, up) > 0.99) & (dot(dup, dup) < r2) & inb(up)
-                okdn = (samplelum(1, dn) > 0.99) & (dot(ddn, ddn) < r2) & inb(dn)
-                return ifelse(okup, dup, ifelse(okdn, ddn, lift([0, 0, 0])))
-            tu = side(vec(1.0 / isz.x, 0.0))
-            tv = side(vec(0.0, 1.0 / isz.y))
-            cr = cross(tu, tv)
-            ok = _near(0, 1, uv, rep, r2) & (rep.w > 0.5)
-            return cr, ok
-        cr, ok = crossv()
-        p.set('a', p.v('a') + ifelse(ok, sqrt(dot(cr, cr)), 0.0))
-        cr, ok = crossv()
-        p.set('nrm', p.v('nrm') + ifelse(ok, cr, lift([0, 0, 0])))
-        p.set('i', i + 1.0)
-    inv = 1.0 / (hf * hf * 16.0)
-    return p, vec(p.v('nrm') * inv, p.v('a') * inv)   # (n.xyz, a) -- area in .w
-
-
-def prog_vals():
-    # in0 input colour, in1 position, in2 uv mask, in3 reps, in4 bbox, in5 info, in6 blur map
-    # -> mean (r, g, b, blur amount) of the texels that belong to the sample
-    p = Program()
-    p.set('isz', samplecol(5, (0.5, 0.5)).xy)
-    p.set('cell', floor(POS * SAMP))
-    p.set('rep', samplecol(3, (floor(POS * SAMP) + 0.5) / SAMP))
-    hf = samplecol(4, LEFT).w
-    p.set('r2', (hf * 2.0) * (hf * 2.0))
-    p.set('csum', [0, 0, 0, 0])
-    p.set('cnt', 0.0)
-    with p.loop('i', 0.0, 24) as L:
-        i = p.v('i')
-        L.until(i >= 16.0)
-        isz, cell, rep, r2 = p.v('isz'), p.v('cell'), p.v('rep'), p.v('r2')
-
-        def one():
-            uv = _subsample(i, cell, isz)
-            ok = _near(1, 2, uv, rep, r2) & (rep.w > 0.5)
-            eff = blur_amount(0, 6, uv)
-            return vec(samplecol(0, uv).xyz, eff), ok
-        v, ok = one()
-        p.set('csum', p.v('csum') + ifelse(ok, v, lift([0, 0, 0, 0])))
-        v, ok = one()
-        p.set('cnt', p.v('cnt') + ifelse(ok, 1.0, 0.0))
-        p.set('i', i + 1.0)
-    cnt = p.v('cnt')
-    return p, ifelse(cnt > 0.5, p.v('csum') / fmax(cnt, 1.0), lift([0, 0, 0, 0]))
-
-
-def prog_keys():
-    # in0 reps, in1 bbox -> (hash voxel id or 2^23 if empty, sample index, 0, 1)
-    p = Program()
-    rep = samplecol(0, POS)
-    bb = samplecol(1, LEFT)
-    v = clamp(floor((rep.xyz - bb.xyz) / bb.w), 0.0, 127.0)
-    px = floor(POS * SAMP)
-    key = ifelse(rep.w > 0.5, (v.z * 128.0 + v.y) * 128.0 + v.x, 8388608.0)
-    return p, vec(key, px.y * SAMP + px.x, 0.0, 1.0)
-
-
-def sort_stages():
-    out = []
-    k = 2
-    while k <= SAMP * SAMP:
-        j = k // 2
-        while j >= 1:
-            out.append((k, j))
-            j //= 2
-        k *= 2
-    return out
-
-
-def prog_sort(k, j):
-    # in0 previous keys -> one bitonic compare/exchange step
-    p = Program()
-    px = floor(POS * SAMP)
-    t = px.y * SAMP + px.x
-
-    def bit(m):
-        return floor(t / m) - floor(t / (2.0 * m)) * 2.0
-    d = bit(float(k)) - bit(float(j))
-    up = d * d < 0.5
-    a = samplecol(0, POS)
-    q = t + (1.0 - bit(float(j)) * 2.0) * float(j)
-    b = samplecol(0, idx_uv(q))
-    less = (a.x < b.x) | ((a.x <= b.x) & (a.y < b.y))
-    return p, ifelse((up & less) | (~up & ~less), a, b)
-
-
-def prog_ranges():
-    # in0 sorted keys -> per hash voxel: (first, end) index into the sorted list
-    p = Program()
-    ijk = pixel_voxel(0)
-    p.set('cid', (ijk.z * 128.0 + ijk.y) * 128.0 + ijk.x)
-    p.set('s1', [0.0, float(SAMP * SAMP)])
-    p.set('s2', [0.0, float(SAMP * SAMP)])
-    with p.loop('i', 0.0, 28) as L:
-        s1, s2 = p.v('s1'), p.v('s2')
-        L.until((s1.x >= s1.y) & (s2.x >= s2.y))
-
-        def step(name, target):
-            s = p.v(name)
-            m = floor((s.x + s.y) * 0.5)
-            go = samplecol(0, idx_uv(m)).x < target
-            p.set(name, ifelse(s.x < s.y, ifelse(go, vec(m + 1.0, s.y), vec(s.x, m)), s))
-        step('s1', p.v('cid'))
-        step('s2', p.v('cid') + 1.0)
-        p.set('i', p.v('i') + 1.0)
-    return p, vec(p.v('s1').x, p.v('s2').x, 0.0, 1.0)
-
-
-def _splat_loop(p, accumulate, active=None):
-    """Gather all surface samples within one blur voxel of this voxel's centre.
-
-    in0 sorted, in1 ranges, in2 reps, in4 params, in5 bbox.
-    `accumulate(sample_uv, tent_weight)` adds the sample's contribution.
-    Leaves the voxel coordinates in variable 'ijk' and the activity in 'nc'."""
-    prm = samplecol(4, LEFT)
-    p.set('ijk', pixel_voxel(0))
-    p.set('C', prm.xyz + (p.v('ijk') + 0.5) * prm.w)
-
-    def corner(sgn):
-        bb = samplecol(5, LEFT)
-        return clamp(floor((p.v('C') + samplecol(4, LEFT).w * sgn - bb.xyz) / bb.w), 0.0, 127.0)
-    p.set('lo', corner(-1.0))
-    p.set('dims', corner(1.0) - p.v('lo') + 1.0)
-    N = samplecol(4, RIGHT).x
-    ijk, dims = p.v('ijk'), p.v('dims')
-    inside = (ijk.x < N) & (ijk.y < N) & (ijk.z < N)
-    if active is not None:
-        inside = inside & active
-    p.set('nc', ifelse(inside, dims.x * dims.y * dims.z, 0.0))
-    p.set('se', [0.0, 0.0])
-    p.set('hv', 0.0)
-    with p.loop('t', 0.0, 65536) as L:
-        se, t = p.v('se'), p.v('t')
-        L.until((se.x >= se.y) & (t >= p.v('nc')))
-        p.set('hv', ifelse(p.v('se').x < p.v('se').y, 1.0, 0.0))
-        entry = samplecol(0, idx_uv(p.v('se').x)).y
-        suv = idx_uv(entry)
-        d = samplecol(2, suv).xyz - p.v('C')
-        h = samplecol(4, LEFT).w
-        tw3 = fmax(1.0 - fmax(d, -d) / h, 0.0)
-        tw = ifelse(p.v('hv') > 0.5, tw3.x * tw3.y * tw3.z, 0.0)
-        accumulate(suv, tw)
-        t, dims = p.v('t'), p.v('dims')
-        q = floor(t / dims.x)
-        cell = p.v('lo') + vec(t - dims.x * q, q - dims.y * floor(q / dims.y), floor(q / dims.y))
-        p.set('se', ifelse(p.v('hv') > 0.5, p.v('se') + lift([1.0, 0.0]),
-                           samplecol(1, voxel_uv(0, cell)).xy))
-        p.set('t', ifelse(p.v('hv') > 0.5, p.v('t'), p.v('t') + 1.0))
-
-
-WSCALE = 16.0   # keeps splat weights well inside half-float range
-
-
-def prog_splat_colour():
-    # in0 sorted, in1 ranges, in2 reps, in3 vals, in4 grid, in5 bbox, in6 area, in7 frame
-    # -> (sum colour*w, sum blur amount*w); sum w is in frame.w.  Empty voxels (frame.w = 0) skip the loop.
-    p = Program()
-    p.set('acc', [0, 0, 0, 0])
-
-    def accumulate(suv, tw):
-        w = samplecol(6, suv).w * tw * WSCALE
-        p.set('acc', p.v('acc') + samplecol(3, suv) * w)
-    _splat_loop(p, accumulate, active=samplecol(7, POS).w > 0.0)
-    return p, p.v('acc')
-
-
-def prog_splat_frame():
-    # in0 sorted, in1 ranges, in2 reps, in4 grid, in5 bbox, in6 area
-    # -> (unit surface normal xyz, sum w) of the voxel; 0 if empty.  Depends only on the mesh.
-    p = Program()
-    p.set('wsum', 0.0)
-    p.set('nsum', [0, 0, 0])
-    p.set('tdia', [0, 0, 0])
-    p.set('toff', [0, 0, 0])
-
-    def accumulate(suv, tw):
-        ar = samplecol(6, suv)
-
-        def unit():
-            n = ar.xyz
-            return n / fmax(sqrt(dot(n, n)), 1e-12)
-        w = ar.w * tw
-        p.set('wsum', p.v('wsum') + w * WSCALE)
-        p.set('nsum', p.v('nsum') + unit() * (samplecol(6, suv).w * tw))
-        n = unit()
-        p.set('tdia', p.v('tdia') + n * n * (samplecol(6, suv).w * tw))
-        n = unit()
-        p.set('toff', p.v('toff') + vec(n.x * n.y, n.x * n.z, n.y * n.z) * (samplecol(6, suv).w * tw))
-    _splat_loop(p, accumulate)
-    # dominant eigenvector of the normal tensor = sign-free surface normal
-    dg = p.v('tdia')
-    p.set('nv', ifelse((dg.x >= dg.y) & (dg.x >= dg.z), lift([1, 0, 0]),
-                       ifelse(dg.y >= dg.z, lift([0, 1, 0]), lift([0, 0, 1]))))
-    for _ in range(8):
-        v, d, o = p.v('nv'), p.v('tdia'), p.v('toff')
-        mv = vec(d.x * v.x + o.x * v.y + o.y * v.z,
-                 o.x * v.x + d.y * v.y + o.z * v.z,
-                 o.y * v.x + o.z * v.y + d.z * v.z)
-        p.set('nv', mv / fmax(sqrt(dot(mv, mv)), 1e-12))
-    nv = p.v('nv')
-    nv = ifelse(dot(nv, p.v('nsum')) < 0.0, -nv, nv)
-    w = p.v('wsum')
-    return p, ifelse(w > 0.0, vec(nv, w), lift([0, 0, 0, 0]))
-
-
-def prog_v0():
-    # in0 colour splat, in1 frame -> (sum colour*w, sum w): the voxels the passes start from
-    p = Program()
-    return p, vec(samplecol(0, POS).xyz, samplecol(1, POS).w)
+def blur_amount(in_slot, map_slot, uv):
+    """per-texel blur scale: 1, the Blur Map input or the luminance of the input itself"""
+    e = select(get_bool('blur_map_from_input'), dot(sample_col(in_slot, uv).xyz, const((0.2126, 0.7152, 0.0722))),
+               sample_lum(map_slot, uv))
+    e = clamp(select(get_bool('invert_blur_map'), 1.0 - e, e), 0.0, 1.0)
+    return select(get_bool('use_blur_map'), e, 1.0)
 
 
 def pass_count():
-    # same as the 2D graph: min(Samples, ceil(Intensity * pi))
-    return fmin(fmax(pi('samples'), 1.0), ceil(fmax(pf('intensity'), 0.0) * math.pi))
+    """same as the 2D graph: min(Samples, ceil(Intensity * pi))"""
+    return fmin(fmax(iparam('samples'), 1.0), fceil(fmax(param('intensity'), 0.0) * math.pi))
 
 
 def pass_on(k):
-    return (pass_count() > k + 0.5) & (pf('intensity') > 0.0)
+    return land(gt(pass_count(), k + 0.5), gt(param('intensity'), 0.0))
 
 
-# mip levels 1..4 are packed side by side in one 1024x512 texture
-QW, QH = 1024, 512
-Q_OX = {1: 0, 2: 512, 3: 768, 4: 832}
+def norm_area(slot_area, slot_total, uv):
+    """sample area in units of the mean sample area (scale-free, like WSB_PackMask)"""
+    return sample_col(slot_area, uv).x / fmax(frame_a(slot_total).x, 1e-30) * float(ref.PMAX * ref.PMAX)
 
 
-def q_uv(l, ijk):
-    n, T, W, H = level_layout(l)
-    zr = floor(ijk.z / T)
-    zc = ijk.z - zr * T
-    return (vec(Q_OX[l] + zc * n + ijk.x, zr * n + ijk.y) + 0.5) / vec(QW, QH)
+# ----------------------------------------------------------------------------
+# surface samples (PMAX x PMAX)
+
+def texel_cross(uv, S, r2, c):
+    """dP/dx x dP/dy at texel uv, with the differences in coarse cells (scale-free).
+    Same neighbour rules as the mask blur's texel_area (slots: 0 position, 1 uv mask)."""
+    p = sample_col(0, uv).xyz
+
+    def inside(q):
+        return land(gt(fmin(q.x, q.y), 0.0), lt(fmax(q.x, q.y), 1.0))
+
+    def diff(step):
+        f, b = uv + step, uv - step
+        fwd = sample_col(0, f).xyz - p
+        bwd = p - sample_col(0, b).xyz
+        fok = land(land(gt(sample_lum(1, f), ref.UV_INSIDE), lt(dot(fwd, fwd), r2)), inside(f))
+        bok = land(land(gt(sample_lum(1, b), ref.UV_INSIDE), lt(dot(bwd, bwd), r2)), inside(b))
+        return select(fok, fwd, select(bok, bwd, const(0.0, 3))) / c
+
+    return cross3(diff(vec(1.0 / S.x, 0.0)), diff(vec(0.0, 1.0 / S.y)))
 
 
-def prog_pyramid(l, k):
-    # in0 level 0 voxels (l = 1) or the previous packed texture (l > 1) -> packed texture with levels 1..l.
-    # Level l is the [1 3 3 1]/8 stride-2 filter of level l-1; lower levels are copied.
-    # Only computed when pass k uses fat taps.
-    p = Program()
-    n, T, W, H = level_layout(l)
-    np_, _, _, _ = level_layout(l - 1)
-    px = floor(POS * vec(QW, QH))
-    loc = px - vec(Q_OX[l], 0.0)
-    tile = floor(loc / n)
-    p.set('ijk', vec(loc - tile * n, tile.y * T + tile.x))
-    inreg = (px.x >= Q_OX[l]) & (px.x < Q_OX[l] + W) & (px.y < H)
-    p.set('acc', [0, 0, 0, 0])
-    on = pass_on(k) & (pf('softness') > 0.0) & inreg
-    p.set('on', ifelse(on, 1.0, 0.0))
-    with p.loop('i', 0.0, 72) as L:
-        i = p.v('i')
-        L.until((i >= 64.0) | (p.v('on') < 0.5))
-        a = fmod(i, 4.0)
-        b = fmod(floor(i / 4.0), 4.0)
-        c = floor(i / 16.0)
-        o = vec(a, b, c)
-        src = p.v('ijk') * 2.0 + o - 1.0
-        wv = ifelse(o.x > 0.5, ifelse(o.x < 2.5, 3.0, 1.0), 1.0) * \
-            ifelse(o.y > 0.5, ifelse(o.y < 2.5, 3.0, 1.0), 1.0) * \
-            ifelse(o.z > 0.5, ifelse(o.z < 2.5, 3.0, 1.0), 1.0) / 512.0
-        inb = (fmin(fmin(src.x, src.y), src.z) >= 0.0) & (fmax(fmax(src.x, src.y), src.z) <= np_ - 1.0)
-        sc = clamp(src, 0.0, np_ - 1.0)
-        val = samplecol(0, voxel_uv(0, sc) if l == 1 else q_uv(l - 1, sc))
-        p.set('acc', p.v('acc') + ifelse(inb, val * wv, lift([0, 0, 0, 0])))
-        p.set('i', i + 1.0)
-    if l == 1:
-        return p, ifelse(p.v('on') > 0.5, p.v('acc'), lift([0, 0, 0, 0]))
-    lower = px.x < Q_OX[l]
-    return p, ifelse(p.v('on') > 0.5, p.v('acc'), ifelse(lower, samplecol(0, POS), lift([0, 0, 0, 0])))
+def _patch_loop(result, accs, read, isz_slot, rep_slot, coarse_slot):
+    """loop over the SUB x SUB reads of this sample's patch, like WSB_PackArea.
+    accs: [(Var, update(taken, uv, ctx) -> Ex)]"""
+    S = ref.SUB
+    i, cell, rep, r2, isz = Var('i', F1), Var('cell', F2), Var('rep', F4), Var('r2', F1), Var('isz', F2)
+    ctx = dict(i=i, cell=cell, rep=rep, r2=r2, isz=isz)
+
+    def take_and_uv():
+        uv = snap(B._sub_uv(cell.get(), i.get()), isz.get())
+        return B._taken(uv, rep.get(), r2.get(), *read), uv
+
+    init = [(isz, lambda: input_size(isz_slot)), (cell, B._cell),
+            (rep, lambda: sample_col(rep_slot, (B._cell() + 0.5) / float(ref.PMAX))),
+            (r2, lambda: B._r2(coarse_slot))]
+    body = []
+    for var, upd in accs:
+        init.append((var, (lambda v=var: const(0.0, B.DIM[v.typ]))))
+        body.append((var, (lambda u=upd, v=var: v.get() + u(*take_and_uv(), ctx))))
+    init.append((i, lambda: const(0.0)))
+    body.append((i, lambda: i.get() + 1.0))
+    n = float(S * S)
+    return Program(result, init=init, cond=lambda: ge(i.get(), n), body=body, counter=i, max_iter=S * S + 8)
 
 
-def _corners(i0, f, uvf, idx):
+def pass_pack_normal():
+    """WSNB_PackNormal (PMAX^2, mesh only) -> (sum of dP/dx x dP/dy over the reads taken, 1):
+    signed (UV handedness), in coarse-cell units. Slots: 0 position, 1 uv mask, 2 PackPos, 3 Coarse, 4 Size."""
+    nsum = Var('nsum', F3)
+
+    def upd(ok, uv, ctx):
+        return select(ok, texel_cross(uv, ctx['isz'].get(), ctx['r2'].get(), frame_a(3).w), const(0.0, 3))
+
+    return _patch_loop(lambda: vec(nsum.get(), 1.0), [(nsum, upd)], (0, 1), 4, 2, 3)
+
+
+def pass_pack_vals():
+    """WSNB_PackVals (PMAX^2) -> mean (r, g, b, blur amount) of the reads taken.
+    Slots: 0 input, 1 position, 2 uv mask, 3 PackPos, 4 Coarse, 5 Size, 6 blur map."""
+    csum, cnt = Var('csum', F4), Var('cnt', F1)
+
+    def upd_c(ok, uv, ctx):
+        return select(ok, vec(sample_col(0, uv).xyz, blur_amount(0, 6, uv)), const(0.0, 4))
+
+    def upd_n(ok, uv, ctx):
+        return select(ok, 1.0, 0.0)
+
+    def result():
+        n = cnt.get()
+        return select(gt(n, 0.5), csum.get() / fmax(n, 1.0), const(0.0, 4))
+
+    return _patch_loop(result, [(csum, upd_c), (cnt, upd_n)], (1, 2), 5, 3, 4)
+
+
+# ----------------------------------------------------------------------------
+# splats (AW x AH voxel tables): each voxel gathers the samples of its box next to
+# it through the sorted list, like WSB_Splat.
+#   slots: 0 sorted keys (Sort1), 1 Cells1, 2 PackPos, 3 PackArea, 4 VoxFit (h), 5 VoxMap,
+#          6 VoxBoxes, 7 SortBoxes, 8 SortFit, 9 AreaTotal, 10 PackNormal / PackVals, 11 Normals
+
+def splat_program(accs, result, active=None):
+    """accs: [(Var, update(sample_uv, weight) -> Ex)]; the weight is the tent weight times
+    the sample's area relative to the mean sample area."""
+    C, lo, dims, nc = Var('C', F3), Var('lo', F3), Var('dims', F3), Var('nc', F1)
+    t, se, hv = Var('t', F1), Var('se', F2), Var('hv', F1)
+    sd, so = Var('sd', F3), Var('so', F4)
+
+    def vm():
+        return sample_col(5, pos())
+
+    def c_init():
+        m = vm()
+        return sample_col(6, box_uv(fmax(m.x, 0.0), 0.0)).xyz + (m[1, 2, 3] + 0.5) * frame_a(4).x
+
+    def cell_range(sign):
+        o = so.get()
+        return clamp(floor((C.get() + frame_a(4).x * sign - o.xyz) / frame_a(8).x), 0.0, sd.get() - 1.0)
+
+    def nc_init():
+        d = dims.get()
+        ok = gt(vm().x, -0.5)
+        if active is not None:
+            ok = land(ok, active())
+        return select(ok, d.x * d.y * d.z, 0.0)
+
+    def sample_and_weight():
+        idx = sample_col(0, index_uv(se.get().x)).y
+        uv = index_uv(idx)
+        q = fmax(1.0 - fabs(sample_col(2, uv).xyz - C.get()) / frame_a(4).x, 0.0)
+        w = q.x * q.y * q.z * norm_area(3, 9, uv)
+        return uv, select(gt(hv.get(), 0.5), w, 0.0)
+
+    def upd_se():
+        d = dims.get()
+        tt = t.get()
+        row = floor(tt / d.x)
+        c = lo.get() + vec(tt - d.x * row, row - d.y * floor(row / d.y), floor(row / d.y))
+        nxt = sample_col(1, atlas_uv(so.get().w + lin3(c, sd.get()))).xy
+        return select(gt(hv.get(), 0.5), se.get() + vec(1.0, 0.0), nxt)
+
+    init = [(so, lambda: sample_col(7, box_uv(fmax(vm().x, 0.0), 0.0))),
+            (sd, lambda: sample_col(7, box_uv(fmax(vm().x, 0.0), 1.0)).xyz),
+            (C, c_init), (lo, lambda: cell_range(-1.0)),
+            (dims, lambda: cell_range(1.0) - lo.get() + 1.0), (nc, nc_init),
+            (t, lambda: const(0.0)), (se, lambda: const(0.0, 2)), (hv, lambda: const(0.0))]
+    # hv first: the accumulators, se and t all decide on the state before this step
+    body = [(hv, lambda: select(lt(se.get().x, se.get().y), 1.0, 0.0))]
+    for var, upd in accs:
+        init.append((var, (lambda v=var: const(0.0, B.DIM[v.typ]))))
+        body.append((var, (lambda u=upd, v=var: v.get() + u(*sample_and_weight()))))
+    body += [(se, upd_se), (t, lambda: select(gt(hv.get(), 0.5), t.get(), t.get() + 1.0))]
+    return Program(result, init=init, cond=lambda: land(ge(se.get().x, se.get().y), ge(t.get(), nc.get())),
+                   body=body, counter=t, max_iter=65536)
+
+
+def pass_normals():
+    """WSNB_Normals (AW x AH, mesh + Quality) -> (unit surface normal, sum w) per voxel, 0 if empty.
+    The normal is the dominant eigenvector of the area-weighted normal tensor (sign-free, so
+    mirrored UV islands don't cancel out), oriented like the summed signed normals."""
+    wsum, nsum, tdia, toff = Var('wsum', F1), Var('nsum', F3), Var('tdia', F3), Var('toff', F3)
+
+    def unit(uv):
+        n = sample_col(10, uv).xyz
+        return n / fmax(fsqrt(dot(n, n)), 1e-30)
+
+    def result():
+        d, o, ns, w = tdia.get(), toff.get(), nsum.get(), wsum.get()
+        v = select(land(ge(d.x, d.y), ge(d.x, d.z)), const((1.0, 0.0, 0.0)),
+                   select(ge(d.y, d.z), const((0.0, 1.0, 0.0)), const((0.0, 0.0, 1.0))))
+        for _ in range(8):                                   # power iteration
+            mv = vec(d.x * v.x + o.x * v.y + o.y * v.z, o.x * v.x + d.y * v.y + o.z * v.z,
+                     o.y * v.x + o.z * v.y + d.z * v.z)
+            v = mv / fmax(fsqrt(dot(mv, mv)), 1e-30)
+        v = select(lt(dot(v, ns), 0.0), -v, v)
+        return select(gt(w, 0.0), vec(v, w), const(0.0, 4))
+
+    def tdia_upd(uv, w):
+        n = unit(uv)
+        return n * n * w
+
+    def toff_upd(uv, w):
+        n = unit(uv)
+        return vec(n.x * n.y, n.x * n.z, n.y * n.z) * w
+
+    accs = [(wsum, lambda uv, w: w), (nsum, lambda uv, w: unit(uv) * w), (tdia, tdia_upd), (toff, toff_upd)]
+    return splat_program(accs, result)
+
+
+def pass_splat_colour():
+    """WSNB_Splat (AW x AH) -> (sum colour * w, sum blur amount * w); sum w is Normals.w.
+    Voxels with no surface nearby (Normals.w = 0) skip the loop."""
+    acc = Var('acc', F4)
+    return splat_program([(acc, lambda uv, w: sample_col(10, uv) * w)], lambda: acc.get(),
+                         active=lambda: gt(sample_col(11, pos()).w, 0.0))
+
+
+def pass_voxels():
+    """WSNB_Voxels (AW x AH) -> (sum colour * w, sum w): what the passes start from.
+    Slots: 0 Splat, 1 Normals."""
+    return Program(lambda: vec(sample_col(0, pos()).xyz, sample_col(1, pos()).w))
+
+
+def pass_radius():
+    """WSNB_Radius (16 x 16, Intensity / Quality) -> (max radius in voxels, length per UV, h, 1).
+    Intensity is in 2D Non-Uniform Blur units: 1 = 1/256 of the UV space, at the mesh's average
+    3D length per UV unit (from its total area). Slots: 0 AreaTotal, 1 VoxFit, 2 Size."""
+    def result():
+        tot = frame_a(0)
+        S = input_size(2)
+        luv = fsqrt(tot.x * S.x * S.y / fmax(tot.y, 1e-12))
+        hq = frame_a(1).x
+        return vec(fmax(param('intensity'), 0.0) * (1.0 / 256.0) * luv / hq, luv, hq, 1.0)
+    return Program(result)
+
+
+# ----------------------------------------------------------------------------
+# per-box mip pyramid, levels 1..4 packed in one table
+
+def pass_mip_boxes():
+    """WSNB_MipBoxes (R_MAX x S_MAX, Quality) -> start of box b's mip levels 1..4 in the packed
+    mip table (level l of a box with n voxels per axis has ceil(n / 2^l)). Slot 0: VoxBoxes."""
+    bases, _, _ = mip_layout()
+    R, S = ref.R_MAX, ref.S_MAX
+    k, acc, box = Var('k', F1), Var('acc', F4), Var('box', F1)
+
+    def vols():
+        tb = box_dims(0, k.get())
+        v = []
+        for l in range(1, LEVELS):
+            d = fceil(tb.xyz * (1.0 / 2 ** l))
+            v.append(d.x * d.y * d.z)
+        return select(gt(tb.w, 0.5), vec(*v), const(0.0, 4))
+
+    def box_init():
+        r, s = my_grid2(R, S)
+        return s * float(R) + r
+
+    return Program(lambda: acc.get() + const([float(bases[l]) for l in range(1, LEVELS)]),
+                   init=[(box, box_init), (acc, lambda: const(0.0, 4)), (k, lambda: const(0.0))],
+                   cond=lambda: ge(k.get(), box.get()),
+                   body=[(acc, lambda: acc.get() + vols()), (k, lambda: k.get() + 1.0)],
+                   counter=k, max_iter=R * S + 8)
+
+
+def mip_level_of(t):
+    bases, _, _ = mip_layout()
+    return 1.0 + flag(ge(t, float(bases[2]))) + flag(ge(t, float(bases[3]))) + flag(ge(t, float(bases[4])))
+
+
+def pass_mip_map():
+    """WSNB_MipMap (packed mip table, Quality): this entry's box (binary search for the first box
+    whose level ends past it) and (i, j, k) in that level -> (box or -1, i, j, k).
+    Slots: 0 MipBoxes, 1 VoxBoxes."""
+    _, QW, QH = mip_layout()
+    nb = float(ref.R_MAX * ref.S_MAX)
+    lo, hi, t, md, past = Var('lo', F1), Var('hi', F1), Var('t', F1), Var('md', F1), Var('past', F1)
+
+    def dims_l(b):
+        tb = box_dims(1, b)
+        return fceil(tb.xyz / pow2(mip_level_of(t.get()))), tb.w
+
+    def end(b):
+        d, valid = dims_l(b)
+        return chan(box_table2(0, b), mip_level_of(t.get())) + select(gt(valid, 0.5), d.x * d.y * d.z, 0.0)
+
+    def result():
+        b = fmin(lo.get(), nb - 1.0)
+        d, _ = dims_l(b)
+        loc = t.get() - chan(box_table2(0, b), mip_level_of(t.get()))
+        row = floor(loc / d.x)
+        kk = floor(row / d.y)
+        return vec(select(lt(lo.get(), nb), b, -1.0), loc - row * d.x, row - kk * d.y, kk)
+
+    return Program(result,
+                   init=[(t, lambda: my_index(QW, QH)), (lo, lambda: const(0.0)), (hi, lambda: const(nb)),
+                         (md, lambda: const(0.0)), (past, lambda: const(0.0))],
+                   cond=lambda: ge(lo.get(), hi.get()),
+                   # md and past first: lo and hi both decide on the same middle box
+                   body=[(md, lambda: floor((lo.get() + hi.get()) * 0.5)),
+                         (past, lambda: flag(gt(end(md.get()), t.get()))),
+                         (hi, lambda: select(on(past.get()), md.get(), hi.get())),
+                         (lo, lambda: select(on(past.get()), lo.get(), md.get() + 1.0))],
+                   counter=lo, max_iter=(ref.R_MAX * ref.S_MAX).bit_length() + 8)
+
+
+def pass_pyramid(l, k):
+    """WSNB_Mip<l> (packed mip table): level l of every box = [1 3 3 1]/8 filter, stride 2, of
+    level l - 1 of the same box (taps outside the box are empty); lower levels are copied. Only
+    computed when pass k uses fat taps. Slots: 0 voxels (l = 1) or the previous mip table,
+    1 MipMap, 2 MipBoxes, 3 VoxBoxes."""
+    bases, QW, QH = mip_layout()
+    i, acc, act, ijk = Var('i', F1), Var('acc', F4), Var('act', F1), Var('ijk', F3)
+    dp, po = Var('dp', F3), Var('po', F1)
+
+    def t():
+        return my_index(QW, QH)
+
+    def bx():
+        return fmax(sample_col(1, pos()).x, 0.0)
+
+    def parent_dims():
+        n0 = box_dims(3, bx()).xyz
+        return n0 if l == 1 else fceil(n0 * (1.0 / 2 ** (l - 1)))
+
+    def parent_off():
+        return sample_col(3, box_uv(bx(), 0.0)).w if l == 1 else chan(box_table2(2, bx()), float(l - 1))
+
+    def active():
+        inreg = land(ge(t(), float(bases[l])), lt(t(), float(bases[l + 1])))
+        return flag(land(land(pass_on(k), gt(param('softness'), 0.0)),
+                         land(inreg, gt(sample_col(1, pos()).x, -0.5))))
+
+    def upd():
+        ii = i.get()
+        o = vec(ii - floor(ii / 4.0) * 4.0, floor(ii / 4.0) - floor(ii / 16.0) * 4.0, floor(ii / 16.0))
+
+        def w1(x):
+            return select(land(gt(x, 0.5), lt(x, 2.5)), 3.0, 1.0)
+        wv = w1(o.x) * w1(o.y) * w1(o.z) * (1.0 / 512.0)
+        src = ijk.get() * 2.0 + o - 1.0
+        d = dp.get()
+        idx = po.get() + lin3(clamp(src, 0.0, d - 1.0), d)
+        uv = atlas_uv(idx) if l == 1 else lin_uv(idx, QW, QH)
+        return acc.get() + select(inside3(src, d), sample_col(0, uv) * wv, const(0.0, 4))
+
+    def result():
+        if l == 1:
+            return select(on(act.get()), acc.get(), const(0.0, 4))
+        lower = lt(t(), float(bases[l]))
+        return select(on(act.get()), acc.get(), select(lower, sample_col(0, pos()), const(0.0, 4)))
+
+    return Program(result,
+                   init=[(ijk, lambda: sample_col(1, pos())[1, 2, 3]), (dp, parent_dims), (po, parent_off),
+                         (act, active), (acc, lambda: const(0.0, 4)), (i, lambda: const(0.0))],
+                   cond=lambda: lor(ge(i.get(), 64.0), lt(act.get(), 0.5)),
+                   body=[(acc, upd), (i, lambda: i.get() + 1.0)],
+                   counter=i, max_iter=72)
+
+
+# ----------------------------------------------------------------------------
+# the Non-Uniform Blur passes (AW x AH)
+#   slots: 0 voxels, 1 mip table, 2 Normals, 3 Splat, 4 Radius, 5 VoxMap, 6 VoxBoxes, 7 MipBoxes
+
+def corners(g, d, uv_of):
+    """trilinear read at voxel-centre coords g of a d-sized grid; corners outside it are empty"""
+    i0 = floor(g)
+    f = g - i0
     acc = None
     for dz in (0, 1):
         for dy in (0, 1):
             for dx in (0, 1):
                 w = (f.x if dx else 1.0 - f.x) * (f.y if dy else 1.0 - f.y) * (f.z if dz else 1.0 - f.z)
-                v = samplecol(idx, uvf(i0 + lift([float(dx), float(dy), float(dz)]))) * w
+                c = i0 + const([float(dx), float(dy), float(dz)])
+                v = select(inside3(c, d), uv_of(clamp(c, 0.0, d - 1.0)), const(0.0, 4)) * w
                 acc = v if acc is None else acc + v
     return acc
 
 
-def tri_v(g, idx=0):
-    """trilinear sample of the level-0 voxels at voxel-centre coords g."""
-    gl = clamp(g, 0.0, 127.0)
-    i0 = fmin(floor(gl), 126.0)
-    return _corners(i0, gl - i0, lambda c: voxel_uv(0, c), idx)
+def fat_tap(g, lev, n0, o0, mo):
+    """(sum c*w, sum w) at level-0 voxel coords g of the voxel's box, blurred to mip level lev
+    (0..4): two trilinear reads. Coarser levels are rescaled by 2^l so a tap on a flat surface
+    weighs the same at any level."""
+    _, QW, QH = mip_layout()
 
+    def tri0():
+        return corners(g, n0, lambda c: sample_col(0, atlas_uv(o0 + lin3(c, n0))))
 
-def pow2_level(l):
-    return ifelse(l < 0.5, 1.0, ifelse(l < 1.5, 2.0, ifelse(l < 2.5, 4.0, ifelse(l < 3.5, 8.0, 16.0))))
+    def triq(l):
+        s = pow2(l)
+        d = fceil(n0 / s)
+        ol = chan(mo, l)
+        return corners((g + 0.5) / s - 0.5, d, lambda c: sample_col(1, lin_uv(ol + lin3(c, d), QW, QH)))
 
-
-def tri_q(l, g, idx):
-    """trilinear sample of packed mip level l (1..4, runtime value) at level-0 voxel-centre coords g."""
-    s = pow2_level(l)
-    n = 128.0 / s
-    T = ifelse(l < 2.5, 8.0, 4.0)
-    ox = ifelse(l < 1.5, 0.0, ifelse(l < 2.5, 512.0, ifelse(l < 3.5, 768.0, 832.0)))
-    gl = clamp((g + 0.5) / s - 0.5, 0.0, n - 1.0)
-    i0 = fmin(floor(gl), n - 2.0)
-
-    def uvf(c):
-        zr = floor(c.z / T)
-        zc = c.z - zr * T
-        return (vec(ox + zc * n + c.x, zr * n + c.y) + 0.5) / vec(QW, QH)
-    return _corners(i0, gl - i0, uvf, idx)
-
-
-def fat_tap(g, lev, iv=0, iq=1):
-    """(sum c*w, sum w) at g, blurred to mip level `lev` (0..4): 2 trilinear lookups.
-    Coarser levels are rescaled by 2^l so a tap on a flat surface weighs the same at any level."""
     l0 = fmin(floor(lev), 3.0)
     f = lev - l0
-    a = ifelse(l0 < 0.5, tri_v(g, iv), tri_q(fmax(l0, 1.0), g, iq) * pow2_level(l0))
-    b = tri_q(l0 + 1.0, g, iq) * pow2_level(l0 + 1.0)
+    a = select(lt(l0, 0.5), tri0(), triq(fmax(l0, 1.0)) * pow2(l0))
+    b = triq(l0 + 1.0) * pow2(l0 + 1.0)
     return a * (1.0 - f) + b * f
 
 
 def approx_log2_clamped(x):
-    """piecewise-linear log2(x) clamped to [0, LEVELS-1]."""
+    """piecewise-linear log2(x), clamped to [0, LEVELS - 1]"""
     x = clamp(x, 1.0, 2.0 ** (LEVELS - 1))
-    o = ifelse(x >= 2.0, 1.0, 0.0) + ifelse(x >= 4.0, 1.0, 0.0) + ifelse(x >= 8.0, 1.0, 0.0) + \
-        ifelse(x >= 16.0, 1.0, 0.0)
-    base = ifelse(x >= 16.0, 16.0, ifelse(x >= 8.0, 8.0, ifelse(x >= 4.0, 4.0, ifelse(x >= 2.0, 2.0, 1.0))))
+    o = flag(ge(x, 2.0)) + flag(ge(x, 4.0)) + flag(ge(x, 8.0)) + flag(ge(x, 16.0))
+    base = select(ge(x, 16.0), 16.0, select(ge(x, 8.0), 8.0, select(ge(x, 4.0), 4.0, select(ge(x, 2.0), 2.0, 1.0))))
     return o + (x / base - 1.0)
 
 
-def prog_pass(k):
-    # in0 voxels (level 0), in1 packed mip levels, in2 frame (normal, w), in3 colour splat (.w = blur*w), in4 radius
-    p = Program()
+def pass_blur(k):
     TWO_PI = 2.0 * math.pi
-    S = fmax(pi('samples'), 1.0)
-    B = clamp(pi('blades'), 1.0, 9.0)
-    p.set('ijk', pixel_voxel(0))
-    p.set('V', samplecol(0, POS))
-    eff = samplecol(3, POS).w / fmax(samplecol(2, POS).w, 1e-12)
-    rv = samplecol(4, (0.5, 0.5)).x
-    p.set('r', rv * clamp(eff, 0.0, 1.0) * exp(-2.0 * k * C_DECAY / fmax(pass_count(), 1.0)))
-    on = pass_on(k) & (p.v('V').w > 0.0) & (p.v('r') > 0.05)
-    p.set('on', ifelse(on, 1.0, 0.0))
-    # tangent frame: reference axis projected on the surface
-    n = samplecol(2, POS).xyz
-    ax = vec(pf('axis_x'), pf('axis_y'), pf('axis_z'))
-    D = ax / fmax(sqrt(dot(ax, ax)), 1e-6)
-    D = ifelse(dot(ax, ax) > 1e-8, D, lift([0, 1, 0]))
-    t1 = D - n * dot(D, n)
-    alt = ifelse(absv(D.x) < 0.9, lift([1, 0, 0]), lift([0, 0, 1]))
-    t1b = alt - n * dot(alt, n)
-    t1 = ifelse(dot(t1, t1) > 0.04, t1, t1b)
-    p.set('t1', t1 / fmax(sqrt(dot(t1, t1)), 1e-6))
-    p.set('t2', cross(samplecol(2, POS).xyz, p.v('t1')))
-    # fat-tap mip level from the tap radius
-    sig = fmax(pf('softness'), 0.0) * 0.4 * p.v('r')
-    p.set('lev', approx_log2_clamped(sig / 0.64))
-    p.set('acc', [0, 0, 0, 0])
-    ir = (1.0 / S) / (k + 1.0)
-    phi = -TWO_PI * pf('angle')
-    an = clamp(pf('anisotropy'), 0.0, 1.0)
-    # j = 0 is the centre tap, j = 1..Blades the polygon corners
-    with p.loop('j', 0.0, 12) as L:
-        j = p.v('j')
-        L.until((j > B) | (p.v('on') < 0.5))
-        th = TWO_PI * ir + j * (TWO_PI / B)
-        s1 = (1.0 - an) * sin(th)
-        c1 = cos(th)
-        X = s1 * sin(phi) + c1 * cos(phi)
-        Y = s1 * cos(phi) - sin(phi) * c1
-        off = (p.v('t1') * X + p.v('t2') * Y) * (p.v('r') * ifelse(j > 0.5, 1.0, 0.0))
-        p.set('acc', p.v('acc') + fat_tap(p.v('ijk') + off, p.v('lev')))
-        p.set('j', j + 1.0)
-    return p, ifelse(p.v('on') > 0.5, p.v('acc') / (B + 1.0), p.v('V'))
+    vm, vv, n0, o0, mo = Var('vm', F4), Var('vv', F4), Var('n0', F3), Var('o0', F1), Var('mo', F4)
+    r, act, t1, t2, lev, acc, j = (Var('r', F1), Var('act', F1), Var('t1', F3), Var('t2', F3), Var('lev', F1),
+                                   Var('acc', F4), Var('j', F1))
+
+    def bx():
+        return fmax(vm.get().x, 0.0)
+
+    def nrm():
+        return sample_col(2, pos()).xyz
+
+    def r_init():
+        e = clamp(sample_col(3, pos()).w / fmax(sample_col(2, pos()).w, 1e-30), 0.0, 1.0)
+        return frame_a(4).x * e * fexp(-(2.0 * k * C_DECAY) / fmax(pass_count(), 1.0))
+
+    def act_init():
+        return flag(land(land(pass_on(k), gt(vm.get().x, -0.5)), land(gt(vv.get().w, 0.0), gt(r.get(), 0.05))))
+
+    def t1_init():
+        # tangent frame: the reference axis projected on the surface (another axis near its pole)
+        n = nrm()
+        ax = vec(param('axis_x'), param('axis_y'), param('axis_z'))
+        l2 = dot(ax, ax)
+        D = select(gt(l2, 1e-8), ax / fmax(fsqrt(l2), 1e-6), const((0.0, 1.0, 0.0)))
+        t = D - n * dot(D, n)
+        alt = select(lt(fabs(D.x), 0.9), const((1.0, 0.0, 0.0)), const((0.0, 0.0, 1.0)))
+        tb = alt - n * dot(alt, n)
+        t = select(gt(dot(t, t), 0.04), t, tb)
+        return t / fmax(fsqrt(dot(t, t)), 1e-6)
+
+    def tap():
+        nbl = clamp(iparam('blades'), 1.0, 9.0)
+        sm = fmax(iparam('samples'), 1.0)
+        jj = j.get()
+        # the 2D graph's ellipse: inner rotation (1 / Samples) / (pass + 1) turns, then Blades corners
+        th = (1.0 / sm) * (TWO_PI / (k + 1.0)) + jj * (TWO_PI / nbl)
+        an = clamp(param('anisotropy'), 0.0, 1.0)
+        phi = param('angle') * -TWO_PI
+        s1 = (1.0 - an) * fsin(th)
+        c1 = fcos(th)
+        X = s1 * fsin(phi) + c1 * fcos(phi)
+        Y = s1 * fcos(phi) - fsin(phi) * c1
+        off = (t1.get() * X + t2.get() * Y) * (r.get() * select(gt(jj, 0.5), 1.0, 0.0))
+        return acc.get() + fat_tap(vm.get()[1, 2, 3] + off, lev.get(), n0.get(), o0.get(), mo.get())
+
+    def result():
+        return select(on(act.get()), acc.get() / (clamp(iparam('blades'), 1.0, 9.0) + 1.0), vv.get())
+
+    return Program(
+        result,
+        init=[(vm, lambda: sample_col(5, pos())), (vv, lambda: sample_col(0, pos())),
+              (n0, lambda: box_dims(6, bx()).xyz), (o0, lambda: sample_col(6, box_uv(bx(), 0.0)).w),
+              (mo, lambda: box_table2(7, bx())), (r, r_init), (act, act_init), (t1, t1_init),
+              (t2, lambda: cross3(nrm(), t1.get())),
+              (lev, lambda: approx_log2_clamped(fmax(param('softness'), 0.0) * 0.4 * r.get() / 0.64)),
+              (acc, lambda: const(0.0, 4)), (j, lambda: const(0.0))],
+        # j = 0 is the centre tap, j = 1..Blades the polygon corners
+        cond=lambda: lor(gt(j.get(), clamp(iparam('blades'), 1.0, 9.0)), lt(act.get(), 0.5)),
+        body=[(acc, tap), (j, lambda: j.get() + 1.0)],
+        counter=j, max_iter=12)
 
 
-def bspline_w(t):
-    t2 = t * t
-    t3 = t2 * t
-    return [(1.0 - t) * (1.0 - t) * (1.0 - t) * (1.0 / 6.0),
-            (t3 * 3.0 - t2 * 6.0 + 4.0) * (1.0 / 6.0),
-            (t2 * 3.0 + t * 3.0 + 1.0 - t3 * 3.0) * (1.0 / 6.0),
-            t3 * (1.0 / 6.0)]
+# ----------------------------------------------------------------------------
+# resolve (input size, colour, 16 bit)
+#   slots: 0 input, 1 position, 2 uv mask, 3 blurred voxels, 4 VoxFit (h), 5 Coarse, 6 SlabX,
+#          7 RunTab, 8 VoxBoxes, 9 blur map, 10 Radius
+
+def dither3(c):
+    """triangular noise of +-Dither 8-bit steps, faded out near 0 and 1 (per channel)"""
+    px = floor(pos() * get('$size', F2))
+    n = hash12(px) + hash12(px + const((37.0, 91.0))) - 1.0
+    k = clamp(fmin(c, 1.0 - c) * 255.0, 0.0, 1.0)
+    return clamp(c + k * (n * param('dither') * (1.0 / 255.0)), 0.0, 1.0)
 
 
-def hash12(q):
-    p3 = vec(q, q.x) * 0.1031
-    p3 = p3 - floor(p3)
-    d = dot(p3, p3.yzx + 33.33)
-    p3 = p3 + d
-    h = (p3.x + p3.y) * p3.z
-    return h - floor(h)
+def pass_resolve():
+    p, bx, fnd, ta, n = Var('p', F3), Var('bx', F1), Var('fnd', F1), Var('ta', F4), Var('n', F3)
+    g0, gf, al, S, i = Var('g0', F3), Var('gf', F3), Var('al', F1), Var('S', F4), Var('i', F1)
+    W = {(ax, a): Var('w%s%d' % (ax, a), F1) for ax in 'xyz' for a in range(4)}
 
+    def g():
+        return clamp((p.get() - ta.get().xyz) / frame_a(4).x - 0.5, 1.0, n.get() - 3.0)
 
-def prog_resolve():
-    # in0 input, in1 position, in2 uv mask, in3 blurred voxels, in4 grid, in5 blur map, in6 radius
-    p = Program()
-    rv = samplecol(6, (0.5, 0.5)).x
-    # texels with no blur (black blur map, outside the UV mask) skip the voxel lookup
-    p.set('al', ifelse(samplelum(2, POS) > 0.5, smoothstep01(rv * blur_amount(0, 5, POS) * 0.5), 0.0))
-    prm = samplecol(4, LEFT)
-    N = samplecol(4, RIGHT).x
-    g = clamp((samplecol(1, POS).xyz - prm.xyz) / prm.w - 0.5, 1.0, N - 2.001)
-    p.set('g0', floor(g))
-    p.set('gf', g - floor(g))
-    gf = p.v('gf')
-    wx, wy, wz = bspline_w(gf.x), bspline_w(gf.y), bspline_w(gf.z)
-    for a in range(4):
-        p.set('wx%d' % a, wx[a])
-    for a in range(4):
-        p.set('wy%d' % a, wy[a])
-    for a in range(4):
-        p.set('wz%d' % a, wz[a])
-    p.set('S', [0, 0, 0, 0])
-    with p.loop('i', 0.0, 72) as L:
-        i = p.v('i')
-        L.until((i >= 64.0) | (p.v('al') <= 0.0))
-        a = fmod(i, 4.0)
-        b = fmod(floor(i / 4.0), 4.0)
-        c = floor(i / 16.0)
+    def al_init():
+        rv = frame_a(10).x
+        ok = land(gt(sample_lum(2, pos()), 0.5), on(fnd.get()))
+        return select(ok, smoothstep01(rv * blur_amount(0, 9, pos()) * 0.5), 0.0)
 
-        def pick(name, x):
-            return ifelse(x < 0.5, p.v(name + '0'), ifelse(x < 1.5, p.v(name + '1'),
-                                                           ifelse(x < 2.5, p.v(name + '2'), p.v(name + '3'))))
-        w = pick('wx', a) * pick('wy', b) * pick('wz', c)
-        v = samplecol(3, voxel_uv(0, p.v('g0') + vec(a, b, c) - 1.0))
-        p.set('S', p.v('S') + v * w)
-        p.set('i', i + 1.0)
-    S = p.v('S')
-    res = S.xyz / fmax(S.w, 1e-12)
-    src = samplecol(0, POS)
-    p.set('out', src.xyz + (res - src.xyz) * p.v('al'))
-    # dither: triangular noise of +-dither/255, faded out at 0 and 1
-    px = floor(POS * SIZE)
-    nz = hash12(px) + hash12(px + 17.17) - 1.0
-    o = p.v('out')
-    fade = clamp(fmin(o, 1.0 - o) * 255.0, 0.0, 1.0)
-    dith = clamp(o + fade * (nz * pf('dither') * (1.0 / 255.0)), 0.0, 1.0)
-    ok = (p.v('al') > 0.0) & (S.w > 1e-12)
-    return p, ifelse(ok, vec(dith, src.w), src)
+    init = [(p, lambda: sample_col(1, pos()).xyz),
+            (bx, lambda: box_of(p.get(), 5, 6, 7)[0]), (fnd, lambda: flag(box_of(p.get(), 5, 6, 7)[1])),
+            (ta, lambda: sample_col(8, box_uv(bx.get(), 0.0))), (n, lambda: box_dims(8, bx.get()).xyz),
+            (g0, lambda: floor(g())), (gf, lambda: g() - floor(g()))]
+    for ax in 'xyz':
+        for a in range(4):
+            init.append((W[(ax, a)], (lambda ax=ax, a=a: bspline_weights(gf.get()['xyz'.index(ax)])[a])))
+    init += [(al, al_init), (S, lambda: const(0.0, 4)), (i, lambda: const(0.0))]
+
+    def pick(ax, x):
+        return select(lt(x, 0.5), W[(ax, 0)].get(), select(lt(x, 1.5), W[(ax, 1)].get(),
+                                                             select(lt(x, 2.5), W[(ax, 2)].get(), W[(ax, 3)].get())))
+
+    def upd():
+        ii = i.get()
+        a, b, c = ii - floor(ii / 4.0) * 4.0, floor(ii / 4.0) - floor(ii / 16.0) * 4.0, floor(ii / 16.0)
+        w = pick('x', a) * pick('y', b) * pick('z', c)
+        cell = g0.get() + vec(a, b, c) - 1.0
+        return S.get() + sample_col(3, atlas_uv(ta.get().w + lin3(cell, n.get()))) * w
+
+    def result():
+        s = S.get()
+        src = sample_col(0, pos())
+        res = s.xyz / fmax(s.w, 1e-12)
+        out = src.xyz + (res - src.xyz) * al.get()
+        ok = land(gt(al.get(), 0.0), gt(s.w, 1e-6))          # s.w is relative to the mean sample area
+        return select(ok, vec(dither3(out), src.w), src)
+
+    return Program(result, init=init, cond=lambda: lor(ge(i.get(), 64.0), le(al.get(), 0.0)),
+                   body=[(S, upd), (i, lambda: i.get() + 1.0)], counter=i, max_iter=72)
 
 
 # ----------------------------------------------------------------------------
 # graph assembly
-class Graph:
-    def __init__(self, uid):
-        self.uid = uid
-        self.nodes = []
-        self.out_uid = {}
-        self.y = 0
-
-    def input_bridge(self, entry, comptype, x, y, params=''):
-        u = self.uid()
-        o = self.uid()
-        self.nodes.append('<compNode><uid v="%d"/><GUILayout><gpos v="%d %d 0"/></GUILayout><compOutputs><compOutput>'
-                          '<uid v="%d"/><comptype v="%d"/></compOutput></compOutputs><compImplementation>'
-                          '<compInputBridge><entry v="%d"/><parameters>%s</parameters></compInputBridge>'
-                          '</compImplementation></compNode>' % (u, x, y, o, comptype, entry, params))
-        self.out_uid[u] = o
-        return u
-
-    def pp(self, name, prog_ret, inputs, size, rel=0, fmt=3, colour=True, x=0, y=0):
-        prog, ret = prog_ret
-        u = self.uid()
-        o = self.uid()
-        dv, cnt = dynamic_value(self.uid, prog, ret)
-        conns = ''.join('<connection><identifier v="%s"/><connRef v="%d"/><connRefOutput v="%d"/></connection>'
-                        % ('input' if k == 0 else 'input:%d' % k, src, self.out_uid[src])
-                        for k, src in enumerate(inputs))
-        self.nodes.append(
-            '<compNode><uid v="%d"/><connections>%s</connections><GUILayout><gpos v="%d %d 0"/></GUILayout>'
-            '<compOutputs><compOutput><uid v="%d"/><comptype v="%d"/></compOutput></compOutputs>'
-            '<compImplementation><compFilter><filter v="pixelprocessor"/><parameters>'
-            '<parameter><name v="outputsize"/><relativeTo v="%d"/><paramValue><constantValueInt2 v="%d %d"/></paramValue></parameter>'
-            '<parameter><name v="format"/><relativeTo v="0"/><paramValue><constantValueInt32 v="%d"/></paramValue></parameter>'
-            '<parameter><name v="colorswitch"/><relativeTo v="0"/><paramValue><constantValueBool v="%d"/></paramValue></parameter>'
-            '<parameter><name v="perpixel"/><relativeTo v="0"/><paramValue>%s</paramValue></parameter>'
-            '</parameters></compFilter></compImplementation></compNode>'
-            % (u, conns, x, y, o, 1 if colour else 2, rel, size[0], size[1], fmt, 1 if colour else 0, dv))
-        self.out_uid[u] = o
-        self.comments.append((u, name))
-        return u
-
-    def output_bridge(self, src, output, x, y):
-        u = self.uid()
-        self.nodes.append('<compNode><uid v="%d"/><connections><connection><identifier v="inputNodeOutput"/>'
-                          '<connRef v="%d"/><connRefOutput v="%d"/></connection></connections><GUILayout>'
-                          '<gpos v="%d %d 0"/></GUILayout><compImplementation><compOutputBridge><output v="%d"/>'
-                          '</compOutputBridge></compImplementation></compNode>' % (u, src, self.out_uid[src], x, y, output))
-        return u
-
 
 def esc(s):
     return s.replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
@@ -727,199 +675,252 @@ def opt(name, value):
     return '<option><name v="%s"/><value v="%s"/></option>' % (name, value)
 
 
-def param_float(uid, ident, label, desc, default, lo, hi, step, group=None, widget='slider', visible=None):
+def param_float(ident, label, desc, default, lo, hi, step, group=None, widget='slider', visible=None):
     opts = opt('clamp', 1) + opt('default', default) + opt('max', hi) + opt('min', lo)
     if step is not None:
         opts += opt('step', step)
     return ('<paraminput><identifier v="%s"/><uid v="%d"/><attributes><label v="%s"/><description v="%s"/>'
             '</attributes><type v="256"/><defaultValue><constantValueFloat1 v="%s"/></defaultValue>'
             '<defaultWidget><name v="%s"/><options>%s</options></defaultWidget>%s%s</paraminput>'
-            % (ident, uid, esc(label), esc(desc), default, widget, opts,
+            % (ident, new_uid(), esc(label), esc(desc), default, widget, opts,
                '<group v="%s"/>' % esc(group) if group else '',
                '<visibleIf v="%s"/>' % esc(visible) if visible else ''))
 
 
-def param_int(uid, ident, label, desc, default, lo, hi, group=None):
+def param_int(ident, label, desc, default, lo, hi, group=None):
     opts = opt('clamp', 1) + opt('default', default) + opt('max', hi) + opt('min', lo) + opt('step', 1)
     return ('<paraminput><identifier v="%s"/><uid v="%d"/><attributes><label v="%s"/><description v="%s"/>'
             '</attributes><type v="16"/><defaultValue><constantValueInt1 v="%d"/></defaultValue>'
             '<defaultWidget><name v="slider"/><options>%s</options></defaultWidget>%s</paraminput>'
-            % (ident, uid, esc(label), esc(desc), default, opts, '<group v="%s"/>' % esc(group) if group else ''))
+            % (ident, new_uid(), esc(label), esc(desc), default, opts,
+               '<group v="%s"/>' % esc(group) if group else ''))
 
 
-def param_bool(uid, ident, label, desc, default, group=None, visible=None):
+def param_bool(ident, label, desc, default, group=None, visible=None):
     return ('<paraminput><identifier v="%s"/><uid v="%d"/><attributes><label v="%s"/><description v="%s"/>'
             '</attributes><type v="4"/><defaultValue><constantValueBool v="%d"/></defaultValue>'
             '<defaultWidget><name v="buttons"/><options>%s</options></defaultWidget>%s%s</paraminput>'
-            % (ident, uid, esc(label), esc(desc), default, opt('default', default),
+            % (ident, new_uid(), esc(label), esc(desc), default, opt('default', default),
                '<group v="%s"/>' % esc(group) if group else '',
                '<visibleIf v="%s"/>' % esc(visible) if visible else ''))
 
 
-def param_image(uid, ident, label, typ, desc=''):
-    default = '<constantValueFloat4 v="0 0 0 0"/>' if typ == 1 else '<constantValueFloat1 v="0"/>'
-    return ('<paraminput><identifier v="%s"/><uid v="%d"/><attributes><label v="%s"/>%s</attributes>'
-            '<isConnectable v="1"/><type v="%d"/><defaultValue>%s</defaultValue><defaultWidget><name v=""/>'
-            '<options/></defaultWidget></paraminput>'
-            % (ident, uid, esc(label), '<description v="%s"/>' % esc(desc) if desc else '', typ, default))
-
-
 PARAM_IDS = ['samples', 'intensity', 'anisotropy', 'blades', 'angle', 'use_blur_map', 'blur_map_from_input',
-             'invert_blur_map', 'softness', 'quality',
-             'axis_x', 'axis_y', 'axis_z', 'dither']
-PARAM_TYPES = {'samples': T_INT, 'blades': T_INT, 'use_blur_map': T_BOOL, 'blur_map_from_input': T_BOOL,
-               'invert_blur_map': T_BOOL}
+             'invert_blur_map', 'softness', 'quality', 'axis_x', 'axis_y', 'axis_z', 'dither']
+PARAM_TYPES = {'samples': T_INT, 'blades': T_INT, 'use_blur_map': BOOL, 'blur_map_from_input': BOOL,
+               'invert_blur_map': BOOL}
 
 
-def params_xml(U, input_type):
+def params_xml():
     BLUR = 'Blur'
     WS = 'World Space'
     axis_desc = 'Object-space direction that Angle 0 points to (projected on the surface).'
+    levels = ', '.join('%d = %d^3' % (k, n) for k, n in sorted(ref.QUALITY.items()))
     return ''.join([
-        param_image(U['input'], 'input', 'Input', input_type),
-        param_image(U['blur_map'], 'blur_map', 'Blur Map', 2,
-                    'Grayscale map that scales the blur: white = full Intensity, black = no blur. '
-                    'Used when "Use Blur Map" is on and "Use Input As Blur Map" is off.'),
-        param_image(U['mesh_position'], 'mesh_position', 'Mesh Position', 1),
-        param_image(U['mesh_uv_mask'], 'mesh_uv_mask', 'Mesh UV Mask', 2),
-        param_int(U['samples'], 'samples', 'Samples',
+        param_int('samples', 'Samples',
                   'Number of blur passes. More passes fill the bokeh shape more smoothly (and cost more).',
                   4, 1, 16, BLUR),
-        param_float(U['intensity'], 'intensity', 'Intensity',
+        param_float('intensity', 'Intensity',
                     'Blur radius, in the same units as the 2D Non-Uniform Blur (1 = 1/256 of the UV space), '
-                    'converted to world space with the average texel density of the mesh.', 10, 0, 50, 0.01, BLUR),
-        param_float(U['anisotropy'], 'anisotropy', 'Anisotropy',
+                    "at the mesh's average texel density. Doesn't depend on how far apart the pieces are.",
+                    10, 0, 50, 0.01, BLUR),
+        param_float('anisotropy', 'Anisotropy',
                     'Squashes the blur shape across the Angle direction (1 = a line).', 0, 0, 1, 0.01, BLUR),
-        param_int(U['blades'], 'blades', 'Blades', 'Number of sides of the bokeh shape.', 5, 1, 9, BLUR),
-        param_float(U['angle'], 'angle', 'Angle',
+        param_int('blades', 'Blades', 'Number of sides of the bokeh shape.', 5, 1, 9, BLUR),
+        param_float('angle', 'Angle',
                     'Rotation of the blur shape around the surface normal, measured from the Reference Axis.',
                     0, 0, 1, None, BLUR, widget='angle'),
-        param_bool(U['use_blur_map'], 'use_blur_map', 'Use Blur Map',
-                   'Scale the blur per texel (off = uniform blur).', 1, BLUR),
-        param_bool(U['blur_map_from_input'], 'blur_map_from_input', 'Use Input As Blur Map',
+        param_bool('use_blur_map', 'Use Blur Map', 'Scale the blur per texel (off = uniform blur).', 1, BLUR),
+        param_bool('blur_map_from_input', 'Use Input As Blur Map',
                    'Use the luminance of the Input itself as the blur map, so no extra texture is needed.', 1, BLUR,
                    visible='input["use_blur_map"]'),
-        param_bool(U['invert_blur_map'], 'invert_blur_map', 'Invert Blur Map',
-                   'Blur the dark areas instead of the bright ones.', 0, BLUR, visible='input["use_blur_map"]'),
-        param_float(U['softness'], 'softness', 'Softness',
+        param_bool('invert_blur_map', 'Invert Blur Map', 'Blur the dark areas instead of the bright ones.', 0, BLUR,
+                   visible='input["use_blur_map"]'),
+        param_float('softness', 'Softness',
                     'Blurs each tap of the bokeh. Higher values are smoother and wrap better around hard '
                     'edges and curved areas; 0 keeps the sharpest bokeh shape.', 0.25, 0, 1, 0.01, WS),
-        param_float(U['quality'], 'quality', 'Quality',
-                    'Voxel grid: 1 = 48^3, 2 = 64^3, 3 = 96^3, 4 = 128^3. Higher keeps finer detail '
-                    'at low Intensity and is slower.', 4, 1, 4, 1, WS),
-        param_float(U['axis_x'], 'axis_x', 'Reference Axis X', axis_desc, 0.0, -1, 1, 0.05, WS),
-        param_float(U['axis_y'], 'axis_y', 'Reference Axis Y', axis_desc, 1.0, -1, 1, 0.05, WS),
-        param_float(U['axis_z'], 'axis_z', 'Reference Axis Z', axis_desc, 0.0, -1, 1, 0.05, WS),
-        param_float(U['dither'], 'dither', 'Dither',
-                    'Fine noise (in 8-bit steps) that hides banding in smooth gradients. 0 = off.', 1.0, 0, 2, 0.05, WS),
+        param_float('quality', 'Quality',
+                    'Voxel budget, shared by all pieces (%s voxels). Higher keeps finer detail at low '
+                    'Intensity and is slower.' % levels, max(ref.QUALITY), 1, max(ref.QUALITY), 1, WS),
+        param_float('axis_x', 'Reference Axis X', axis_desc, 0.0, -1, 1, 0.05, WS),
+        param_float('axis_y', 'Reference Axis Y', axis_desc, 1.0, -1, 1, 0.05, WS),
+        param_float('axis_z', 'Reference Axis Z', axis_desc, 0.0, -1, 1, 0.05, WS),
+        param_float('dither', 'Dither',
+                    'Fine noise (in 8-bit steps) that hides banding in smooth gradients. 0 = off.', 1.0, 0, 2, 0.05,
+                    WS),
     ])
 
 
-def gui_comments(g, uid):
-    return ''.join('<GUIObject><type v="COMMENT"/><GUIDependency v="NODE?%d"/><GUILayout><gpos v="0 60 -100"/>'
-                   '<size v="140 40"/></GUILayout><GUIName v="%s"/><uid v="%d"/>'
-                   '<frameColor v="0.196 0.196 0.51 0.196"/></GUIObject>' % (u, esc(name), uid())
-                   for u, name in g.comments)
+def image_input(g, ident, label, color, desc='', fmt32=False, primary=False, x=0, y=0):
+    uid, node_uid, out_uid = new_uid(), new_uid(), new_uid()
+    default = '<constantValueFloat4 v="0 0 0 0"/>' if color else '<constantValueFloat1 v="0"/>'
+    g.paraminputs.append(
+        '<paraminput><identifier v="%s"/><uid v="%d"/><attributes><label v="%s"/>%s</attributes>'
+        '<isConnectable v="1"/><type v="%d"/><defaultValue>%s</defaultValue><defaultWidget><name v=""/>'
+        '<options/></defaultWidget></paraminput>'
+        % (ident, uid, esc(label), '<description v="%s"/>' % esc(desc) if desc else '', 1 if color else 2, default))
+    if primary:
+        g.primary = uid
+    params = B.fmt_param('format', 'constantValueInt1', 3) if fmt32 else ''
+    g.nodes.append(
+        '<compNode><uid v="%d"/><GUILayout><gpos v="%d %d 0"/></GUILayout><compOutputs><compOutput><uid v="%d"/>'
+        '<comptype v="%d"/></compOutput></compOutputs><compImplementation><compInputBridge><entry v="%d"/>'
+        '<parameters>%s</parameters></compInputBridge></compImplementation></compNode>'
+        % (node_uid, x, y, out_uid, 1 if color else 2, uid, params))
+    return node_uid, out_uid
 
 
-def icon_xml():
-    """docs/icon/world_space_non_uniform_blur.png (made by make_icon.py) in the .sbs icon format:
-    base64(uint32 big-endian size + zlib(png))."""
-    import base64, struct, zlib
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'docs', 'icon', GRAPH_ID + '.png')
-    if not os.path.exists(path):
-        return ''
-    png = open(path, 'rb').read()
-    data = base64.b64encode(struct.pack('>I', len(png)) + zlib.compress(png, 9)).decode()
-    return '<icon><datalength v="%d"/><format v="png"/><strdata v="%s"/></icon>' % (len(png), data)
+def inputs(g, color_input):
+    return dict(
+        input=image_input(g, 'input', 'Input', color_input, primary=True, x=-1600, y=0),
+        blur_map=image_input(g, 'blur_map', 'Blur Map', False,
+                             'Grayscale map that scales the blur: white = full Intensity, black = no blur. '
+                             'Used when "Use Blur Map" is on and "Use Input As Blur Map" is off.', x=-1600, y=600),
+        mesh_position=image_input(g, 'mesh_position', 'Mesh Position', True, fmt32=True, x=-1600, y=200),
+        mesh_uv_mask=image_input(g, 'mesh_uv_mask', 'Mesh UV Mask', False, x=-1600, y=400))
 
 
-def graph_xml(ident, guid, label, desc, params, primary, out_uid, nodes, gui):
-    return ('<graph><identifier v="%s"/><uid v="%d"/>'
-            '<graphtype v="filter"/><attributes><label v="%s"/><author v="Doru Bogdan"/>'
-            '<authorURL v="https://www.artstation.com/sublime"/><tags v="filter;blur;non uniform;bokeh;world space"/>'
-            '<description v="%s"/>%s</attributes><paraminputs>%s</paraminputs><primaryInput v="%d"/>'
-            '<graphOutputs><graphoutput><identifier v="output"/><uid v="%d"/><attributes><label v="Output"/>'
-            '</attributes></graphoutput></graphOutputs><compNodes>%s</compNodes><baseParameters/>'
-            '<GUIObjects>%s</GUIObjects><options><option><name v="defaultParentSize"/><value v="11x11"/></option>'
-            '</options><root><rootOutputs><rootOutput><output v="%d"/><format v="0"/><usertag v=""/></rootOutput>'
-            '</rootOutputs></root></graph>'
-            % (ident, guid, esc(label), esc(desc), icon_xml(), params, primary, out_uid, ''.join(nodes), gui, out_uid))
+def output_color(g, ident, label, src, x=0, y=0):
+    uid, node_uid = new_uid(), new_uid()
+    g.outputs.append('<graphoutput><identifier v="%s"/><uid v="%d"/><attributes><label v="%s"/></attributes>'
+                     '</graphoutput>' % (ident, uid, label))
+    n, o = src
+    g.nodes.append('<compNode><uid v="%d"/><connections><connection><identifier v="inputNodeOutput"/>'
+                   '<connRef v="%d"/><connRefOutput v="%d"/></connection></connections><GUILayout>'
+                   '<gpos v="%d %d 0"/></GUILayout><compImplementation><compOutputBridge><output v="%d"/>'
+                   '</compOutputBridge></compImplementation></compNode>' % (node_uid, n, o, x, y, uid))
+    g.root_output = uid
 
 
-IMAGE_IDS = ['input', 'blur_map', 'mesh_position', 'mesh_uv_mask']
-POS_FORMAT = ('<parameter><name v="format"/><relativeTo v="0"/><paramValue><constantValueInt1 v="3"/>'
-              '</paramValue></parameter>')
+def graph_xml(g, desc):
+    return g.xml(desc).replace('<tags v="filter;mask;blur;world space"/>', '<tags v="%s"/>' % TAGS)
 
 
-def build_colour(uid):
-    g = Graph(uid)
-    g.comments = []
-    guid = uid()
-    U = {k: uid() for k in IMAGE_IDS + PARAM_IDS + ['output']}
+def icon_path():
+    return os.path.join(os.path.dirname(HERE), 'docs', 'icon', GRAPH_ID + '.png')
 
-    n_in = g.input_bridge(U['input'], 1, -1600, 0)
-    n_pos = g.input_bridge(U['mesh_position'], 1, -1600, 200, POS_FORMAT)
-    n_uvm = g.input_bridge(U['mesh_uv_mask'], 2, -1600, 400)
-    n_bm = g.input_bridge(U['blur_map'], 2, -1600, 600)
 
-    X = -1400
-    n_info = g.pp('WSNB_Size', prog_info(), [n_pos], (-4, -4), rel=1, x=X, y=800)
-    n_bbox = g.pp('WSNB_Bounds', prog_bbox(), [n_pos, n_uvm, n_info], (4, 4), x=X + 150, y=700)
-    n_reps = g.pp('WSNB_Samples', prog_reps(), [n_pos, n_uvm, n_info], (9, 9), x=X + 150, y=500)
-    n_area = g.pp('WSNB_Area', prog_area(), [n_pos, n_uvm, n_reps, n_bbox, n_info], (9, 9), x=X + 300, y=500)
-    n_den = g.pp('WSNB_Density', prog_density(), [n_area, n_info], (4, 4), x=X + 300, y=700)
-    n_prm = g.pp('WSNB_Grid', prog_grid(), [n_bbox], (4, 4), x=X + 300, y=850)
-    n_rad = g.pp('WSNB_Radius', prog_radius(), [n_bbox, n_den, n_prm], (4, 4), x=X + 450, y=850)
-    n_vals = g.pp('WSNB_Values', prog_vals(), [n_in, n_pos, n_uvm, n_reps, n_bbox, n_info, n_bm], (9, 9),
-                  x=X + 450, y=300)
-    n_keys = g.pp('WSNB_Keys', prog_keys(), [n_reps, n_bbox], (9, 9), x=X + 300, y=1000)
-    prev = n_keys
-    for s, (k, j) in enumerate(sort_stages()):
-        prev = g.pp('WSNB_Sort', prog_sort(k, j), [prev], (9, 9), x=X + 450 + 30 * (s % 40), y=1100 + 120 * (s // 40))
-    n_sorted = prev
-    n_rng = g.pp('WSNB_Ranges', prog_ranges(), [n_sorted], atlas_size_log2(0), x=X + 450, y=1700)
-    splat_in = [n_sorted, n_rng, n_reps, n_vals, n_prm, n_bbox, n_area]
-    A0 = atlas_size_log2(0)
-    n_frm = g.pp('WSNB_Frame', prog_splat_frame(), splat_in, A0, fmt=F16, x=X + 600, y=700)
-    n_col = g.pp('WSNB_Splat', prog_splat_colour(), splat_in + [n_frm], A0, fmt=F16, x=X + 600, y=500)
-    V = g.pp('WSNB_Voxels', prog_v0(), [n_col, n_frm], A0, fmt=F16, x=X + 700, y=500)
+def build_colour():
+    g = B.Graph(GRAPH_ID, 'World Space Non Uniform Blur')
+    if os.path.exists(icon_path()):
+        g.set_icon(icon_path())
+    I = inputs(g, True)
+    g.paraminputs.append(params_xml())
+    src, bmap, position, uvmask = I['input'], I['blur_map'], I['mesh_position'], I['mesh_uv_mask']
+
+    def pp(name, prog, ins, size, x, y, **kw):
+        return g.pixel_processor(name, prog, ins, size, x=x, y=y, **kw)
+
+    def lin(n):
+        w, h = lin_dims(n)
+        return log2(w), log2(h)
+
+    P, S, R, Dn = ref.PMAX, ref.S_MAX, ref.R_MAX, ref.DMAX
+    lp = (log2(P), log2(P))
+    atl = (log2(ref.AW), log2(ref.AH))
+    one = (4, 4)
+    boxt = (log2(2 * R), log2(S))
+    _, QW, QH = mip_layout()
+    qt = (log2(QW), log2(QH))
+
+    # --- mesh only: World Space Mask Blur v2.0, as is ---
+    size = g.pixel_processor('WSB_Size', B.pass_size(), [position], None, x=-1400, y=600,
+                             rel_log2=(B.SIZE_LOG2, B.SIZE_LOG2))
+    bounds = pp('WSB_Bounds', B.pass_bounds(), [position, uvmask, size], one, -1250, 500)
+    coarse = pp('WSB_Coarse', B.pass_coarse(), [bounds], one, -1150, 500)
+    pack_pos = pp('WSB_PackPos', B.pass_pack_pos(), [position, uvmask, size], lp, -1250, 300)
+    pack_area = pp('WSB_PackArea', B.pass_pack_area(), [position, uvmask, pack_pos, coarse, size], lp, -1100, 400)
+    area_blocks = pp('WSB_AreaBlocks', B.pass_area_blocks(), [pack_area], (log2(ref.AREA_GRID),) * 2, -1000, 450)
+    area_total = pp('WSB_AreaTotal', B.pass_area_total(), [area_blocks], one, -900, 450)
+    keys = pp('WSB_Keys0', B.pass_keys0(), [pack_pos, coarse], lp, -1100, 850)
+    for n, (k, j) in enumerate(ref.sort_steps()):
+        keys = pp('WSB_Sort0 %d/%d' % (k, j), B.pass_sort_step(k, j), [keys], lp, -950 + 30 * (n % 40),
+                  850 + 120 * (n // 40))
+    cells0 = pp('WSB_Cells0', B.pass_cells(ref.CW, ref.CH), [keys], (log2(ref.CW), log2(ref.CH)), -650, 1600)
+    cellb = pp('WSB_CellBounds', B.pass_cell_bounds(), [keys, cells0, pack_pos], (log2(2 * ref.CW), log2(ref.CH)),
+               -500, 1600)
+    colxz = pp('WSB_ColXZ', B.pass_columns(True), [cellb, coarse], (log2(2 * Dn), log2(Dn)), -350, 1550)
+    colxy = pp('WSB_ColXY', B.pass_columns(False), [cellb, coarse], (log2(2 * Dn), log2(Dn)), -350, 1650)
+    occx = pp('WSB_OccX', B.pass_occ_x(), [colxz, coarse], lin(Dn), -200, 1500)
+    slabx = pp('WSB_SlabX', B.pass_slab_x(), [occx], lin(Dn), -100, 1500)
+    slabr = pp('WSB_SlabRange', B.pass_slab_range(), [slabx, coarse], lin(S), 0, 1500)
+    occzy = pp('WSB_OccZY', B.pass_occ_zy(), [colxz, colxy, slabr, coarse], (log2(Dn), log2(S)), 100, 1600)
+    runtab = pp('WSB_RunTab', B.pass_run_tab(), [occzy], (log2(Dn), log2(S)), 200, 1600)
+    runr = pp('WSB_RunRange', B.pass_run_range(), [runtab], (log2(R), log2(S)), 300, 1600)
+    bw, bh = lin_dims(S * R * Dn)
+    boxrow = pp('WSB_BoxRow', B.pass_box_row(), [colxz, colxy, slabr, runr], (log2(2 * bw), log2(bh)), 400, 1600)
+    boxes = pp('WSB_Boxes', B.pass_boxes(), [boxrow, slabr], boxt, 500, 1600)
+    sortfit = pp('WSB_SortFit', B.pass_fit(lambda: const(float(ref.AW * ref.AH))), [boxes, bounds], one, 600, 1500)
+    sortboxes = pp('WSB_SortBoxes', B.pass_grid_table(lambda: frame_a(1).x), [boxes, sortfit], boxt, 700, 1500)
+    keys = pp('WSB_Keys1', B.pass_keys1(), [pack_pos, coarse, slabx, runtab, sortboxes, sortfit], lp, 800, 1500)
+    for n, (k, j) in enumerate(ref.sort_steps()):
+        keys = pp('WSB_Sort1 %d/%d' % (k, j), B.pass_sort_step(k, j), [keys], lp, 900 + 30 * (n % 40),
+                  1500 + 120 * (n // 40))
+    cells1 = pp('WSB_Cells1', B.pass_cells(ref.AW, ref.AH), [keys], atl, -650, 600)
+
+    # --- Quality: the voxel grids of the boxes (the finest that fits the budget) and their mips ---
+    voxfit = pp('WSB_VoxFit', B.pass_fit(B.q_budget), [boxes, bounds], one, -1000, 700)
+    voxboxes = pp('WSB_VoxBoxes', B.pass_grid_table(lambda: frame_a(1).x), [boxes, voxfit], boxt, -800, 650)
+    voxmap = pp('WSB_VoxMap', B.pass_vox_map(), [voxboxes], atl, -700, 650)
+    mipboxes = pp('WSNB_MipBoxes', pass_mip_boxes(), [voxboxes], (log2(R), log2(S)), -700, 750)
+    mipmap = pp('WSNB_MipMap', pass_mip_map(), [mipboxes, voxboxes], qt, -600, 750)
+
+    # --- surface normals (mesh + Quality) and the input (colour, blur amount) ---
+    pack_normal = pp('WSNB_PackNormal', pass_pack_normal(), [position, uvmask, pack_pos, coarse, size], lp, -950, 250)
+    splat_in = [keys, cells1, pack_pos, pack_area, voxfit, voxmap, voxboxes, sortboxes, sortfit, area_total]
+    normals = pp('WSNB_Normals', pass_normals(), splat_in + [pack_normal], atl, -500, 450, fmt=FMT_16F)
+    pack_vals = pp('WSNB_PackVals', pass_pack_vals(), [src, position, uvmask, pack_pos, coarse, size, bmap], lp,
+                   -950, 150)
+    splat = pp('WSNB_Splat', pass_splat_colour(), splat_in + [pack_vals, normals], atl, -500, 300, fmt=FMT_16F)
+    V = pp('WSNB_Voxels', pass_voxels(), [splat, normals], atl, -400, 300, fmt=FMT_16F)
+    radius = pp('WSNB_Radius', pass_radius(), [area_total, voxfit, size], one, -400, 700)
+
+    # --- Non-Uniform Blur passes ---
     for k in range(MAX_PASSES):
-        x0 = X + 800 + 200 * k
+        x0 = -300 + 200 * k
         q = V
         for l in range(1, LEVELS):
-            q = g.pp('WSNB_Mip%d' % l, prog_pyramid(l, k), [q], (10, 9), fmt=F16, x=x0, y=300 + 120 * l)
-        V = g.pp('WSNB_Pass%d' % (k + 1), prog_pass(k), [V, q, n_frm, n_col, n_rad], A0, fmt=F16, x=x0 + 100, y=200)
-    n_out = g.pp('WSNB_Resolve', prog_resolve(), [n_in, n_pos, n_uvm, V, n_prm, n_bm, n_rad], (0, 0), rel=1, fmt=1,
-                 x=X + 800 + 200 * MAX_PASSES + 200, y=0)
-    g.output_bridge(n_out, U['output'], X + 800 + 200 * MAX_PASSES + 400, 0)
-    desc = ('v' + VERSION + ' - Non-uniform (bokeh) blur done in 3D using the mesh position, so it is continuous across UV seams. '
-            'The Blur Map scales the blur per texel like the 2D Non-Uniform Blur.')
-    return graph_xml(GRAPH_ID, guid, 'World Space Non Uniform Blur', desc, params_xml(U, 1), U['input'],
-                     U['output'], g.nodes, gui_comments(g, uid)), len(g.nodes)
+            q = pp('WSNB_Mip%d' % l, pass_pyramid(l, k), [q, mipmap, mipboxes, voxboxes], qt, x0, 400 + 120 * l,
+                   fmt=FMT_16F)
+        V = pp('WSNB_Pass%d' % (k + 1), pass_blur(k), [V, q, normals, splat, radius, voxmap, voxboxes, mipboxes],
+               atl, x0 + 100, 300, fmt=FMT_16F)
+    out = g.pixel_processor('WSNB_Resolve', pass_resolve(),
+                            [src, position, uvmask, V, voxfit, coarse, slabx, runtab, voxboxes, bmap, radius],
+                            None, color=True, fmt=FMT_16, x=-300 + 200 * MAX_PASSES + 200, y=0)
+    output_color(g, 'output', 'Output', out, x=-300 + 200 * MAX_PASSES + 400, y=0)
+    desc = ('v%s - Non-uniform (bokeh) blur done in 3D using the mesh position, so it is continuous across UV '
+            'seams. The Blur Map (or the input itself) scales the blur per texel like the 2D Non-Uniform Blur. '
+            "Pieces laid out apart get their own voxel grids, so spreading them out doesn't coarsen the blur, "
+            "and they don't blur into each other." % VERSION)
+    return graph_xml(g, desc), len(g.nodes)
 
 
-def instance_param(uid, name):
-    typ = PARAM_TYPES.get(name, T_F1)
+def instance_param(name):
+    typ = PARAM_TYPES.get(name, F1)
+    if typ == T_INT:
+        ex = Ex('get_integer1', T_INT, data=('constantValueString', name))
+    elif typ == BOOL:
+        ex = get_bool(name)
+    else:
+        ex = param(name)
+    em = B.FunctionEmitter()
+    root = em.emit(ex, {})
     return ('<parameter><name v="%s"/><relativeTo v="0"/><paramValue>%s</paramValue></parameter>'
-            % (name, dynamic_expr(uid, get(name, typ))))
+            % (name, em.xml(root)))
 
 
-def build_grayscale(uid, pkg_uid):
+def build_grayscale(pkg_uid):
     """Grayscale wrapper: gray -> colour, instance of the colour graph, colour -> gray."""
-    g = Graph(uid)
-    g.comments = []
-    guid = uid()
-    U = {k: uid() for k in IMAGE_IDS + PARAM_IDS + ['output']}
-    n_in = g.input_bridge(U['input'], 2, -600, 0)
-    n_pos = g.input_bridge(U['mesh_position'], 1, -600, 200, POS_FORMAT)
-    n_uvm = g.input_bridge(U['mesh_uv_mask'], 2, -600, 400)
-    n_bm = g.input_bridge(U['blur_map'], 2, -600, 600)
-    p = Program()
-    n_col = g.pp('WSNB_ToColour', (p, samplecol(0, POS)), [n_in], (0, 0), rel=1, fmt=1, x=-400, y=0)
-    u = uid()
-    o = uid()
-    conns = [('input', n_col), ('blur_map', n_bm), ('mesh_position', n_pos), ('mesh_uv_mask', n_uvm)]
+    g = B.Graph(GRAPH_ID + '_grayscale', 'World Space Non Uniform Blur Grayscale')
+    if os.path.exists(icon_path()):
+        g.set_icon(icon_path())
+    I = inputs(g, False)
+    g.paraminputs.append(params_xml())
+    col = g.pixel_processor('WSNB_ToColour', Program(lambda: sample_col(0, pos())), [I['input']], None,
+                            color=True, fmt=FMT_16, x=-400, y=0)
+    u, o = new_uid(), new_uid()
+    conns = [('input', col), ('blur_map', I['blur_map']), ('mesh_position', I['mesh_position']),
+             ('mesh_uv_mask', I['mesh_uv_mask'])]
     g.nodes.append(
         '<compNode><uid v="%d"/><connections>%s</connections><GUILayout><gpos v="-150 200 0"/></GUILayout>'
         '<compOutputs><compOutput><uid v="%d"/><comptype v="1"/></compOutput></compOutputs><compImplementation>'
@@ -927,35 +928,35 @@ def build_grayscale(uid, pkg_uid):
         '<outputBridging><uid v="%d"/><identifier v="output"/></outputBridging></outputBridgings></compInstance>'
         '</compImplementation></compNode>'
         % (u, ''.join('<connection><identifier v="%s"/><connRef v="%d"/><connRefOutput v="%d"/></connection>'
-                      % (k, src, g.out_uid[src]) for k, src in conns),
-           o, GRAPH_ID, pkg_uid, ''.join(instance_param(uid, n) for n in PARAM_IDS), o))
-    g.out_uid[u] = o
-    p = Program()
-    n_gray = g.pp('WSNB_ToGray', (p, samplecol(0, POS).x), [u], (0, 0), rel=1, fmt=1, colour=False, x=100, y=0)
-    g.output_bridge(n_gray, U['output'], 300, 0)
-    desc = 'v' + VERSION + ' - Grayscale version of World Space Non Uniform Blur (for masks).'
-    return graph_xml(GRAPH_ID + '_grayscale', guid, 'World Space Non Uniform Blur Grayscale', desc,
-                     params_xml(U, 2), U['input'], U['output'], g.nodes, gui_comments(g, uid))
+                      % (name, n_, o_) for name, (n_, o_) in conns),
+           o, GRAPH_ID, pkg_uid, ''.join(instance_param(p_) for p_ in PARAM_IDS), o))
+    gray = g.pixel_processor('WSNB_ToGray', Program(lambda: sample_col(0, pos()).x), [(u, o)], None,
+                             color=False, fmt=FMT_16, x=100, y=0)
+    g.output('output', 'Output', gray, x=300, y=0)
+    return graph_xml(g, 'v%s - Grayscale version of World Space Non Uniform Blur (for masks).' % VERSION)
+
+
+def build_xml():
+    pkg_uid = new_uid()
+    colour, n = build_colour()
+    gray = build_grayscale(pkg_uid)
+    xml = ('<?xml version="1.0" encoding="UTF-8"?><package><identifier v="%s"/><formatVersion v="1.1.0.202302"/>'
+           '<updaterVersion v="1.1.0.202302"/><fileUID v="{4f6b2a1e-93c7-4d0a-b8e5-7c2d91a3f604}"/>'
+           '<versionUID v="0"/><dependencies><dependency><filename v="?himself"/><uid v="%d"/><type v="package"/>'
+           '<fileUID v="0"/><versionUID v="0"/></dependency></dependencies><content>%s%s</content></package>'
+           % (GRAPH_ID, pkg_uid, colour, gray))
+    return xml, n
 
 
 def build(path):
-    uid = UID(1700000000)
-    pkg_uid = uid()
-    colour, n = build_colour(uid)
-    gray = build_grayscale(uid, pkg_uid)
-    xml = ('<?xml version="1.0" encoding="UTF-8"?><package><identifier v="%s"/><formatVersion v="1.1.0.202302"/>'
-           '<updaterVersion v="1.1.0.202302"/><fileUID v="{4f6b2a1e-93c7-4d0a-b8e5-7c2d91a3f604}"/><versionUID v="0"/>'
-           '<dependencies><dependency><filename v="?himself"/><uid v="%d"/><type v="package"/><fileUID v="0"/>'
-           '<versionUID v="0"/></dependency></dependencies><content>%s%s</content></package>'
-           % (GRAPH_ID, pkg_uid, colour, gray))
+    xml, n = build_xml()
     with open(path, 'w') as f:
         f.write(xml)
     return n
 
 
 if __name__ == '__main__':
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                             OUTPUT_NAME)
+    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(HERE), OUTPUT_NAME)
     n = build(out)
     from check_types import check
     probs = check(out)

@@ -13,6 +13,10 @@ import xml.etree.ElementTree as ET
 
 np.seterr(all='ignore')
 
+# work counters, per pixel-processor uid: {'reads': texture reads, 'nodes': node evaluations}
+STATS = {}
+_current = {'uid': None}
+
 
 class FnGraph:
     def __init__(self, dv):
@@ -77,6 +81,11 @@ class Evaluator:
         return r
 
     def op(self, fn, ins, d, c):
+        st = STATS.get(_current['uid'])
+        if st is not None:
+            st['nodes'] += c.n
+            if fn in ('samplecol', 'samplelum'):
+                st['reads'] += c.n
         A = lambda k='a': self.ev(ins[k], c)
         n = c.n
         if fn.startswith('const_float'):
@@ -308,6 +317,8 @@ def run_graph(path, graph_id, images, params=None, targets=None, keep=None, verb
         color = P['colorswitch'].find('paramValue')[0].get('v') == '1'
         fmtv = int(P['format'].find('paramValue')[0].get('v'))
         t0 = time.time()
+        STATS[uid] = {'reads': 0, 'nodes': 0, 'size': (W, H), 'rel': rel}
+        _current['uid'] = uid
         img = eval_pp(P['perpixel'].find('paramValue/dynamicValue'), W, H, ins, prm, color)
         if fmtv in (0, 1):
             q = 255.0 if fmtv == 0 else 65535.0
