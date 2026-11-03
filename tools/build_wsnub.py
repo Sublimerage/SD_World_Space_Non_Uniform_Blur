@@ -253,11 +253,22 @@ def pass_pack_vals():
 # splats (AW x AH voxel tables): each voxel gathers the samples of its box next to
 # it through the sorted list, like WSB_Splat.
 #   slots: 0 sorted keys (Sort1), 1 Cells1, 2 PackPos, 3 PackArea, 4 VoxFit (h), 5 VoxMap,
-#          6 VoxBoxes, 7 SortBoxes, 8 SortFit, 9 AreaTotal, 10 PackNormal / PackVals, 11 Normals
+#          6 VoxBoxes, 7 SortBoxes, 8 SortFit, 9 AreaTotal, 10 PackNormal / PackVals, 11 Normals,
+#   and with `fast`: 12 SortedPos, 13 SortedNormal / SortedVals, 14 NearZ (Normals only)
 
-def splat_program(accs, result, active=None):
-    """accs: [(Var, update(sample_uv, weight) -> Ex)]; the weight is the tent weight times
-    the sample's area relative to the mean sample area."""
+def unit3(n):
+    return n / fmax(fsqrt(dot(n, n)), 1e-30)
+
+
+def splat_program(accs, result, active=None, extra=lambda v: v, fast=False, near=False):
+    """accs: [(Var, update(value, weight) -> Ex)]: value is the sample's slot-10 value after
+    `extra`, weight the tent weight times the sample's area relative to the mean sample area.
+
+    `fast` gives the same result with less work: samples are read from copies in sorted
+    order (SortedPos: position and relative area, slot 13: the value after `extra`), 2 reads
+    next to each other instead of 5 scattered ones; with `near`, a voxel whose sort cell has
+    no occupied cell within NearZ's reach (more than the walk reaches) skips the walk, whose
+    sum would be 0."""
     C, lo, dims, nc = Var('C', F3), Var('lo', F3), Var('dims', F3), Var('nc', F1)
     t, se, hv = Var('t', F1), Var('se', F2), Var('hv', F1)
     sd, so = Var('sd', F3), Var('so', F4)
@@ -273,19 +284,31 @@ def splat_program(accs, result, active=None):
         o = so.get()
         return clamp(floor((C.get() + frame_a(4).x * sign - o.xyz) / frame_a(8).x), 0.0, sd.get() - 1.0)
 
+    def near_ok():
+        o = so.get()
+        c0 = clamp(floor((C.get() - o.xyz) / frame_a(8).x), 0.0, sd.get() - 1.0)
+        return gt(sample_col(14, atlas_uv(o.w + lin3(c0, sd.get()))).x, 0.5)
+
     def nc_init():
         d = dims.get()
         ok = gt(vm().x, -0.5)
         if active is not None:
             ok = land(ok, active())
+        if fast and near:
+            ok = land(ok, near_ok())
         return select(ok, d.x * d.y * d.z, 0.0)
 
-    def sample_and_weight():
-        idx = sample_col(0, index_uv(se.get().x)).y
-        uv = index_uv(idx)
-        q = fmax(1.0 - fabs(sample_col(2, uv).xyz - C.get()) / frame_a(4).x, 0.0)
-        w = q.x * q.y * q.z * norm_area(3, 9, uv)
-        return uv, select(gt(hv.get(), 0.5), w, 0.0)
+    def value_and_weight():
+        if fast:
+            here = index_uv(se.get().x)
+            sp = sample_col(12, here)
+            p, na, val = sp.xyz, sp.w, sample_col(13, here)
+        else:
+            uv = index_uv(sample_col(0, index_uv(se.get().x)).y)
+            p, na, val = sample_col(2, uv).xyz, norm_area(3, 9, uv), extra(sample_col(10, uv))
+        q = fmax(1.0 - fabs(p - C.get()) / frame_a(4).x, 0.0)
+        w = q.x * q.y * q.z * na
+        return val, select(gt(hv.get(), 0.5), w, 0.0)
 
     def upd_se():
         d = dims.get()
@@ -304,21 +327,17 @@ def splat_program(accs, result, active=None):
     body = [(hv, lambda: select(lt(se.get().x, se.get().y), 1.0, 0.0))]
     for var, upd in accs:
         init.append((var, (lambda v=var: const(0.0, B.DIM[v.typ]))))
-        body.append((var, (lambda u=upd, v=var: v.get() + u(*sample_and_weight()))))
+        body.append((var, (lambda u=upd, v=var: v.get() + u(*value_and_weight()))))
     body += [(se, upd_se), (t, lambda: select(gt(hv.get(), 0.5), t.get(), t.get() + 1.0))]
     return Program(result, init=init, cond=lambda: land(ge(se.get().x, se.get().y), ge(t.get(), nc.get())),
                    body=body, counter=t, max_iter=65536)
 
 
-def pass_normals():
+def pass_normals(fast=False):
     """WSNB_Normals (AW x AH, mesh + Quality) -> (unit surface normal, sum w) per voxel, 0 if empty.
     The normal is the dominant eigenvector of the area-weighted normal tensor (sign-free, so
     mirrored UV islands don't cancel out), oriented like the summed signed normals."""
     wsum, nsum, tdia, toff = Var('wsum', F1), Var('nsum', F3), Var('tdia', F3), Var('toff', F3)
-
-    def unit(uv):
-        n = sample_col(10, uv).xyz
-        return n / fmax(fsqrt(dot(n, n)), 1e-30)
 
     def result():
         d, o, ns, w = tdia.get(), toff.get(), nsum.get(), wsum.get()
@@ -331,24 +350,25 @@ def pass_normals():
         v = select(lt(dot(v, ns), 0.0), -v, v)
         return select(gt(w, 0.0), vec(v, w), const(0.0, 4))
 
-    def tdia_upd(uv, w):
-        n = unit(uv)
-        return n * n * w
-
-    def toff_upd(uv, w):
-        n = unit(uv)
-        return vec(n.x * n.y, n.x * n.z, n.y * n.z) * w
-
-    accs = [(wsum, lambda uv, w: w), (nsum, lambda uv, w: unit(uv) * w), (tdia, tdia_upd), (toff, toff_upd)]
-    return splat_program(accs, result)
+    accs = [(wsum, lambda n, w: w), (nsum, lambda n, w: n.xyz * w), (tdia, lambda n, w: n.xyz * n.xyz * w),
+            (toff, lambda n, w: vec(n.x * n.y, n.x * n.z, n.y * n.z) * w)]
+    return splat_program(accs, result, extra=lambda v: unit3(v.xyz), fast=fast, near=True)
 
 
-def pass_splat_colour():
+def pass_splat_colour(fast=False):
     """WSNB_Splat (AW x AH) -> (sum colour * w, sum blur amount * w); sum w is Normals.w.
     Voxels with no surface nearby (Normals.w = 0) skip the loop."""
     acc = Var('acc', F4)
-    return splat_program([(acc, lambda uv, w: sample_col(10, uv) * w)], lambda: acc.get(),
-                         active=lambda: gt(sample_col(11, pos()).w, 0.0))
+    return splat_program([(acc, lambda v, w: v * w)], lambda: acc.get(),
+                         active=lambda: gt(sample_col(11, pos()).w, 0.0), fast=fast)
+
+
+def pass_sorted_copy(value=None):
+    """WSNB_SortedPos / SortedNormal (mesh only) / SortedVals (PMAX^2): the splat's per-sample
+    values in sorted order, so a splat reads them next to each other. value(slot, uv) -> Ex;
+    default: slot 1 as is. Slot 0: sorted keys."""
+    value = value or (lambda slot, uv: sample_col(slot, uv))
+    return Program(lambda: value(1, index_uv(sample_col(0, pos()).y)))
 
 
 def pass_voxels():
@@ -619,7 +639,13 @@ def dither3(c):
     return clamp(c + k * (n * param('dither') * (1.0 / 255.0)), 0.0, 1.0)
 
 
-def pass_resolve():
+def pass_resolve(fast=False):
+    """Tricubic B-spline lookup of the texel's box grid (64 reads), blended with the input by the
+    local blur amount, dithered; written as 16 bit. Texels with nothing to blur (outside the UV
+    islands, in no box, or with a black blur map) skip the reads and keep the input.
+
+    `fast` gives the same result with less work: 16 loop steps of 4 reads instead of 64 of 1,
+    added in the same order with the same weights, so the sum is bit-identical."""
     p, bx, fnd, ta, n = Var('p', F3), Var('bx', F1), Var('fnd', F1), Var('ta', F4), Var('n', F3)
     g0, gf, al, S, i = Var('g0', F3), Var('gf', F3), Var('al', F1), Var('S', F4), Var('i', F1)
     W = {(ax, a): Var('w%s%d' % (ax, a), F1) for ax in 'xyz' for a in range(4)}
@@ -652,6 +678,17 @@ def pass_resolve():
         cell = g0.get() + vec(a, b, c) - 1.0
         return S.get() + sample_col(3, atlas_uv(ta.get().w + lin3(cell, n.get()))) * w
 
+    def upd4():
+        kk = i.get()
+        c = floor(kk / 4.0)
+        b = kk - c * 4.0
+        acc = S.get()
+        for a in range(4):
+            w = pick('x', const(float(a))) * pick('y', b) * pick('z', c)
+            cell = g0.get() + vec(float(a), b, c) - 1.0
+            acc = acc + sample_col(3, atlas_uv(ta.get().w + lin3(cell, n.get()))) * w
+        return acc
+
     def result():
         s = S.get()
         src = sample_col(0, pos())
@@ -660,8 +697,9 @@ def pass_resolve():
         ok = land(gt(al.get(), 0.0), gt(s.w, 1e-6))          # s.w is relative to the mean sample area
         return select(ok, vec(dither3(out), src.w), src)
 
-    return Program(result, init=init, cond=lambda: lor(ge(i.get(), 64.0), le(al.get(), 0.0)),
-                   body=[(S, upd), (i, lambda: i.get() + 1.0)], counter=i, max_iter=72)
+    steps = 16.0 if fast else 64.0
+    return Program(result, init=init, cond=lambda: lor(ge(i.get(), steps), le(al.get(), 0.0)),
+                   body=[(S, upd4 if fast else upd), (i, lambda: i.get() + 1.0)], counter=i, max_iter=int(steps) + 8)
 
 
 # ----------------------------------------------------------------------------
@@ -800,7 +838,7 @@ def icon_path():
     return os.path.join(os.path.dirname(HERE), 'docs', 'icon', GRAPH_ID + '.png')
 
 
-def build_colour():
+def build_colour(fast=True):
     g = B.Graph(GRAPH_ID, 'World Space Non Uniform Blur')
     if os.path.exists(icon_path()):
         g.set_icon(icon_path())
@@ -868,10 +906,29 @@ def build_colour():
     # --- surface normals (mesh + Quality) and the input (colour, blur amount) ---
     pack_normal = pp('WSNB_PackNormal', pass_pack_normal(), [position, uvmask, pack_pos, coarse, size], lp, -950, 250)
     splat_in = [keys, cells1, pack_pos, pack_area, voxfit, voxmap, voxboxes, sortboxes, sortfit, area_total]
-    normals = pp('WSNB_Normals', pass_normals(), splat_in + [pack_normal], atl, -500, 450, fmt=FMT_16F)
     pack_vals = pp('WSNB_PackVals', pass_pack_vals(), [src, position, uvmask, pack_pos, coarse, size, bmap], lp,
                    -950, 150)
-    splat = pp('WSNB_Splat', pass_splat_colour(), splat_in + [pack_vals, normals], atl, -500, 300, fmt=FMT_16F)
+    if fast:
+        # same result, less work: samples in sorted order, and voxels with no surface in reach skip the walk
+        sorted_pos = pp('WSNB_SortedPos', pass_sorted_copy(lambda slot, uv: vec(sample_col(slot, uv).xyz,
+                                                                                norm_area(2, 3, uv))),
+                        [keys, pack_pos, pack_area, area_total], lp, -650, 450)
+        sorted_nrm = pp('WSNB_SortedNormal', pass_sorted_copy(lambda slot, uv: vec(unit3(sample_col(slot, uv).xyz),
+                                                                                   1.0)),
+                        [keys, pack_normal], lp, -650, 500)
+        sorted_vals = pp('WSNB_SortedVals', pass_sorted_copy(), [keys, pack_vals], lp, -650, 150)
+        sortmap = pp('WSB_SortMap', B.pass_vox_map(), [sortboxes], atl, -650, 750)
+        near = cells1
+        for axis, name in enumerate('XYZ'):
+            near = pp('WSB_Near%s' % name, B.pass_near(axis, axis == 0), [near, sortmap, sortboxes, voxfit, sortfit],
+                      atl, -620 + 40 * axis, 750)
+        normals = pp('WSNB_Normals', pass_normals(True), splat_in + [pack_normal, pack_normal, sorted_pos, sorted_nrm,
+                                                                     near], atl, -500, 450, fmt=FMT_16F)
+        splat = pp('WSNB_Splat', pass_splat_colour(True), splat_in + [pack_vals, normals, sorted_pos, sorted_vals],
+                   atl, -500, 300, fmt=FMT_16F)
+    else:
+        normals = pp('WSNB_Normals', pass_normals(), splat_in + [pack_normal], atl, -500, 450, fmt=FMT_16F)
+        splat = pp('WSNB_Splat', pass_splat_colour(), splat_in + [pack_vals, normals], atl, -500, 300, fmt=FMT_16F)
     V = pp('WSNB_Voxels', pass_voxels(), [splat, normals], atl, -400, 300, fmt=FMT_16F)
     radius = pp('WSNB_Radius', pass_radius(), [area_total, voxfit, size], one, -400, 700)
 
@@ -884,7 +941,7 @@ def build_colour():
                    fmt=FMT_16F)
         V = pp('WSNB_Pass%d' % (k + 1), pass_blur(k), [V, q, normals, splat, radius, voxmap, voxboxes, mipboxes],
                atl, x0 + 100, 300, fmt=FMT_16F)
-    out = g.pixel_processor('WSNB_Resolve', pass_resolve(),
+    out = g.pixel_processor('WSNB_Resolve', pass_resolve(fast),
                             [src, position, uvmask, V, voxfit, coarse, slabx, runtab, voxboxes, bmap, radius],
                             None, color=True, fmt=FMT_16, x=-300 + 200 * MAX_PASSES + 200, y=0)
     output_color(g, 'output', 'Output', out, x=-300 + 200 * MAX_PASSES + 400, y=0)
@@ -936,9 +993,11 @@ def build_grayscale(pkg_uid):
     return graph_xml(g, 'v%s - Grayscale version of World Space Non Uniform Blur (for masks).' % VERSION)
 
 
-def build_xml():
+def build_xml(fast=True):
+    """The package XML. fast=False builds the plain graph the speed-ups are tested against
+    (same output, more work)."""
     pkg_uid = new_uid()
-    colour, n = build_colour()
+    colour, n = build_colour(fast)
     gray = build_grayscale(pkg_uid)
     xml = ('<?xml version="1.0" encoding="UTF-8"?><package><identifier v="%s"/><formatVersion v="1.1.0.202302"/>'
            '<updaterVersion v="1.1.0.202302"/><fileUID v="{4f6b2a1e-93c7-4d0a-b8e5-7c2d91a3f604}"/>'
@@ -948,8 +1007,8 @@ def build_xml():
     return xml, n
 
 
-def build(path):
-    xml, n = build_xml()
+def build(path, fast=True):
+    xml, n = build_xml(fast)
     with open(path, 'w') as f:
         f.write(xml)
     return n

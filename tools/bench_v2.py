@@ -64,7 +64,8 @@ def group(name, v1):
     if v1:
         stroke = ('WSNB_Values', 'WSNB_Splat', 'WSNB_Frame', 'WSNB_Mip', 'WSNB_Pass', 'WSNB_Resolve')
     else:
-        stroke = ('WSNB_PackVals', 'WSNB_Splat', 'WSNB_Voxels', 'WSNB_Radius', 'WSNB_Mip1', 'WSNB_Mip2', 'WSNB_Mip3',
+        stroke = ('WSNB_PackVals', 'WSNB_SortedVals', 'WSNB_Splat', 'WSNB_Voxels', 'WSNB_Radius', 'WSNB_Mip1',
+                  'WSNB_Mip2', 'WSNB_Mip3',
                   'WSNB_Mip4', 'WSNB_Pass', 'WSNB_Resolve')
     return 'stroke' if name.startswith(stroke) else 'mesh'
 

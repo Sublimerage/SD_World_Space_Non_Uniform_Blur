@@ -107,11 +107,50 @@ so it's an upper bound, not a timing. The full-resolution pass (the final lookup
 * If it's still slow: lower **Quality** (3 is about half the work of 4), and apply the
   filter only to the channels that need it, since Painter runs a filter once per channel.
 
+### Speed-ups that don't change the result
+
+Ported from World Space Mask Blur (`ef8f9ed`). Each only skips work whose result is already
+known; `tools/build_wsnub.py` builds them by default (`build(fast=True)`), and `fast=False`
+builds the plain graph they're tested against.
+
+1. **Resolve**: the 64 voxel reads run in 16 loop steps of 4 (instead of 64 of 1), added in
+   the same order with the same weights. Texels with nothing to blur (outside the UV islands,
+   in no box, or with a black blur map) already skipped the reads and keep the input.
+2. **Normals splat**: per Quality change, `WSB_NearX/Y/Z` mark sort cells with an occupied cell
+   within `ceil(h / hs) + 1` cells (more than a voxel's walk reaches); voxels whose cell isn't
+   near skip the walk, whose sum would be 0. The colour splat already skips voxels whose normal
+   splat is empty. The bokeh passes and mips reach much farther, so they're left as they are.
+3. **Both splats** read each sample from copies in sorted order (`WSNB_SortedPos`: position and
+   relative area, `WSNB_SortedNormal`: unit normal, mesh only; `WSNB_SortedVals`: colour and blur
+   amount, per stroke): 2 reads next to each other instead of 5 scattered ones.
+
+At 2048², Quality 4, Intensity 10 (`tools/bench_v2.py`, plain → fast):
+
+| Scene | Per stroke: reads | node evals | Once per mesh or Quality: reads | node evals |
+|---|---|---|---|---|
+| Sphere | 1.20 → 1.18 G (−1 %) | 42.9 → 38.4 G (−11 %) | 1.98 → 0.86 G (−57 %) | 40.9 → 26.6 G |
+| Kit layout, 4 pieces | 1.38 → 1.35 G (−2 %) | 52.4 → 46.1 G (−12 %) | 1.97 → 1.00 G (−50 %) | 40.9 → 29.9 G |
+| Flat plane | 2.09 → 1.99 G (−5 %) | 90.1 → 76.1 G (−16 %) | 1.87 → 1.36 G (−27 %) | 39.2 → 38.9 G |
+
+The per-stroke gain is small because, unlike in the mask blur, most of this filter's per-stroke
+work is in the bokeh passes and their mips (about 75 % of the reads), which these don't touch;
+the biggest saving is in the normals splat, which reruns only when the mesh or Quality changes.
+
+**Exactness**: `tools/test_fast_exact.py` runs the fast and the plain graph on 40 cases at
+reduced sizes (box, sphere, box at 1/1000, kit layouts: 4 pieces, 6 in a row, a column along Z, a
+stack along Y; every Quality; Intensity 2 – 48; voxels 1× – 47× a sort cell; Anisotropy, Angle,
+Blades 3 / 9, Softness 0 / 1, Samples 1 / 16, Reference Axis, blur map off / from the input /
+inverted, Dither; the grayscale graph) and requires every output pixel to be exactly equal: all
+40 are, and the plain graph also equals the released v2.0 (`dde603a`) bit for bit. The difference
+maps are all black (`docs/images/fast_vs_plain_diff.png`). At the real table sizes, the three
+scenes above also give 0 differing pixels (`tools/bench_v2.py` on both builds).
+
 ## Testing
 
 ```
 pip install numpy pillow scipy
 python3 tools/test_v2.py            # reduced sizes, about a minute
+python3 tools/test_fast_exact.py    # speed-ups change no pixel: 40 cases, about 10 minutes
 ```
 
 `tools/sbsinterp.py` is a small numpy interpreter for pixel-processor graphs; the tests run the
@@ -150,8 +189,9 @@ python3 tools/make_icon.py         # re-renders docs/icon/ (runs the graph; then
   (6× finer on a flat piece, 10× closer to the 2D filter there). Quality is a voxel budget
   shared by the pieces. Fixed: the "is there surface here" tests used absolute 3D areas, so
   small meshes or small units could leave texels unblurred; areas are now relative to the
-  mesh's mean sample area. Per-stroke cost −24 % on a single object. Parameters are the
-  same as 1.0. The v1.0 `.sbs` is in the git history (commit `933e48b`).
+  mesh's mean sample area. Per-stroke cost −24 % on a single object. Speed-ups that change no
+  pixel: 11–16 % fewer node evaluations per stroke, 27–57 % fewer reads per mesh / Quality change.
+  Parameters are the same as 1.0. The v1.0 `.sbs` is in the git history (commit `933e48b`).
 * **1.0**: first versioned release.
 
 ## Notes

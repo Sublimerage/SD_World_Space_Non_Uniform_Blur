@@ -1,7 +1,7 @@
 # Vendored from World Space Mask Blur v2.0
 
 Unmodified copies from `Sublimerage/my-project`, branch
-`claude/substance-painter-advanced-filters-d7wbo5`, commit `b0a3582`:
+`claude/substance-painter-advanced-filters-d7wbo5`, commit `ef8f9ed` ("Speed-ups that change no pixel"; the v2.0 passes are unchanged from `b0a3582`):
 
 | File | Source |
 |---|---|

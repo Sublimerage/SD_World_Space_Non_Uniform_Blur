@@ -1203,9 +1203,9 @@ def atlas_uv(i):
 
 
 def pass_vox_map():
-    """WSB_VoxMap (AW x AH): this voxel's box (binary search for the first box
-    whose end is past it) and (i, j, k) in it -> (box or -1, i, j, k).
-    Slot 0: VoxBoxes."""
+    """WSB_VoxMap / WSB_SortMap (AW x AH): this voxel's (or sort cell's) box
+    (binary search for the first box whose end is past it) and (i, j, k) in it
+    -> (box or -1, i, j, k). Slot 0: VoxBoxes / SortBoxes."""
     nb = float(NB())
     lo, hi, v, md, past = Var("lo", F1), Var("hi", F1), Var("v", F1), Var("md", F1), Var("past", F1)
 
@@ -1233,11 +1233,17 @@ def pass_vox_map():
         counter=lo, max_iter=NB().bit_length() + 8)
 
 
-def pass_splat():
+def pass_splat(fast=True):
     """WSB_Splat (AW x AH) -> (sum w*area*mask, sum w*area, same, same), tent
     weights. Each voxel walks the cells of its box's sort grid overlapping
     [C - h, C + h] and their samples. Slots: 0 sorted keys, 1 Cells1, 2 PackPos,
-    3 PackMask, 4 Frame, 5 VoxMap, 6 VoxBoxes, 7 SortBoxes, 8 SortFit."""
+    3 PackMask, 4 Frame, 5 VoxMap, 6 VoxBoxes, 7 SortBoxes, 8 SortFit, and with
+    `fast`: 9 NearZ, 10 SortedPos, 11 SortedMask.
+
+    `fast` gives the same result with less work: a voxel whose sort cell has
+    no occupied cell within NearZ's reach (more than the walk can reach) has
+    no samples to add, so it skips the walk; and samples are read from copies
+    in sorted order (2 reads next to each other instead of 3 scattered ones)."""
     C, lo, dims, nc = Var("C", F3), Var("lo", F3), Var("dims", F3), Var("nc", F1)
     t, se, hv, acc = Var("t", F1), Var("se", F2), Var("hv", F1), Var("acc", F2)
     sd, so = Var("sd", F3), Var("so", F4)
@@ -1253,18 +1259,27 @@ def pass_splat():
         o = so.get()
         return clamp(floor((C.get() + frame_a(4).x * sign - o.xyz) / frame_a(8).x), 0.0, sd.get() - 1.0)
 
+    def near():
+        o = so.get()
+        c0 = clamp(floor((C.get() - o.xyz) / frame_a(8).x), 0.0, sd.get() - 1.0)
+        return gt(sample_col(9, atlas_uv(o.w + lin3(c0, sd.get()))).x, 0.5)
+
     def nc_init():
         d = dims.get()
-        return select(gt(vm().x, -0.5), d.x * d.y * d.z, 0.0)
+        active = gt(vm().x, -0.5)
+        return select(land(active, near()) if fast else active, d.x * d.y * d.z, 0.0)
 
     def upd_acc():
         ptr = se.get().x
-        idx = sample_col(0, index_uv(ptr)).y
-        uv = index_uv(idx)
+        if fast:
+            p, m = sample_col(10, index_uv(ptr)).xyz, sample_col(11, index_uv(ptr)).xy
+        else:
+            uv = index_uv(sample_col(0, index_uv(ptr)).y)
+            p, m = sample_col(2, uv).xyz, sample_col(3, uv).xy
         h = frame_a(4).x
-        q = fmax(1.0 - fabs(sample_col(2, uv).xyz - C.get()) / h, 0.0)
+        q = fmax(1.0 - fabs(p - C.get()) / h, 0.0)
         w = q.x * q.y * q.z
-        return acc.get() + select(gt(hv.get(), 0.5), sample_col(3, uv).xy * w, const(0.0, 2))
+        return acc.get() + select(gt(hv.get(), 0.5), m * w, const(0.0, 2))
 
     def upd_se():
         d = dims.get()
@@ -1288,6 +1303,47 @@ def pass_splat():
         body=[(hv, lambda: select(lt(se.get().x, se.get().y), 1.0, 0.0)), (acc, upd_acc), (se, upd_se),
               (t, lambda: select(gt(hv.get(), 0.5), t.get(), t.get() + 1.0))],
         counter=t, max_iter=65536)
+
+
+def pass_sorted_copy():
+    """WSB_SortedPos (mesh only) / WSB_SortedMask (PMAX^2): PackPos / PackMask
+    in sorted order, so the splat reads each sample's values next to each other.
+    Slots: 0 sorted keys, 1 PackPos / PackMask."""
+    return Program(lambda: sample_col(1, index_uv(sample_col(0, pos()).y)))
+
+
+def pass_near(axis, first):
+    """WSB_NearX / Y / Z (AW x AH, Radius / Quality): is an occupied sort cell
+    within r = ceil(h / hs) + 1 cells along `axis` (X reads the cells' own
+    occupancy, Y and Z the previous pass), so NearZ covers a (2r + 1)^3 block:
+    more than a voxel's walk ever reaches, which is at most ceil(h / hs) cells
+    either way. -> (near, 0, 0, 1). Slots: 0 Cells1 (X) or the previous Near,
+    1 SortMap, 2 SortBoxes, 3 Frame, 4 SortFit."""
+    e = [0.0, 0.0, 0.0]
+    e[axis] = 1.0
+    d, r, occ, act, ijk, n, off = (Var("d", F1), Var("r", F1), Var("occ", F1), Var("act", F1), Var("ijk", F3),
+                                   Var("n", F3), Var("off", F1))
+
+    def bx():
+        return fmax(sample_col(1, pos()).x, 0.0)
+
+    def upd():
+        q = ijk.get() + const(e) * d.get()
+        qa = q[axis]
+        ok = land(ge(qa, 0.0), lt(qa, n.get()[axis]))
+        v = sample_col(0, atlas_uv(off.get() + lin3(clamp(q, 0.0, n.get() - 1.0), n.get())))
+        hit = gt(v.y, v.x) if first else gt(v.x, 0.5)
+        return fmax(occ.get(), flag(land(ok, hit)))
+
+    return Program(
+        lambda: vec(occ.get(), 0.0, 0.0, 1.0),
+        init=[(ijk, lambda: sample_col(1, pos())[1, 2, 3]), (act, lambda: flag(gt(sample_col(1, pos()).x, -0.5))),
+              (n, lambda: sample_col(2, box_uv(bx(), 1.0)).xyz), (off, lambda: sample_col(2, box_uv(bx(), 0.0)).w),
+              (r, lambda: fceil(frame_a(3).x / frame_a(4).x) + 1.0), (occ, lambda: const(0.0)),
+              (d, lambda: -r.get())],
+        cond=lambda: lor(gt(d.get(), r.get()), lt(act.get(), 0.5)),
+        body=[(occ, upd), (d, lambda: d.get() + 1.0)],
+        counter=d, max_iter=65536)
 
 
 def pass_blur(axis):
@@ -1357,13 +1413,37 @@ def bspline_weights(t):
             t3 * (1.0 / 6.0)]
 
 
-def pass_resolve():
+def _resolve_finish(s, ok_pre):
+    """The blurred value from the 64 summed taps s, as the Resolve output."""
+    m = sample_lum(0, pos())
+    ok = land(ok_pre, gt(s.y, 1e-6))
+    bl = clamp(s.x / fmax(s.y, 1e-12), 0.0, 1.0)
+    # Smear Strength: towards smeared mass / plain density (adds, never averages away)
+    st = select(get_bool("smear_enable"), param("smear_strength"), 1.0)
+    undiluted = clamp(s.x / fmax(s.w, 1e-12), 0.0, 1.0)
+    bl = bl + (undiluted - bl) * ((st - 1.0) * (1.0 / 3.0))
+    blurred = dither(select(get_bool("shape_enable"), levels(bl), bl))
+    return select(ok, blurred, m)
+
+
+def _pick(ws, i):
+    """ws[i] for a float index i in 0..3 (exactly the same value)."""
+    return select(lt(i, 0.5), ws[0], select(lt(i, 1.5), ws[1], select(lt(i, 2.5), ws[2], ws[3])))
+
+
+def pass_resolve(fast=True):
     """Tricubic B-spline lookup of the texel's box grid (64 texel-center
     samples), dithered against 8-bit banding; written as 16 bit.
     Slots: 0 mask, 1 position, 2 uv mask, 3 blurred grid, 4 Frame, 5 Coarse,
-    6 SlabX, 7 RunTab, 8 VoxBoxes."""
+    6 SlabX, 7 RunTab, 8 VoxBoxes.
+
+    `fast` gives the same result with less work: the 64 reads run in a loop
+    (16 steps of 4, in the same order, so the sum is the same) that texels
+    outside the UV islands, or in no box, skip; those keep the input anyway."""
+    if fast:
+        return _pass_resolve_loop()
+
     def result():
-        m = sample_lum(0, pos())
         h = frame_a(4).x
         p = sample_col(1, pos()).xyz
         b, found = box_of(p, 5, 6, 7)
@@ -1380,16 +1460,45 @@ def pass_resolve():
                     cell = i0 + const([a - 1.0, bb - 1.0, c - 1.0])
                     term = sample_col(3, atlas_uv(ta.w + lin3(cell, n))) * (wx[a] * wy[bb] * wz[c])
                     s = term if s is None else s + term
-        ok = land(land(gt(sample_lum(2, pos()), 0.5), gt(s.y, 1e-6)), found)
-        bl = clamp(s.x / fmax(s.y, 1e-12), 0.0, 1.0)
-        # Smear Strength: towards smeared mass / plain density (adds, never averages away)
-        st = select(get_bool("smear_enable"), param("smear_strength"), 1.0)
-        undiluted = clamp(s.x / fmax(s.w, 1e-12), 0.0, 1.0)
-        bl = bl + (undiluted - bl) * ((st - 1.0) * (1.0 / 3.0))
-        blurred = dither(select(get_bool("shape_enable"), levels(bl), bl))
-        return select(ok, blurred, m)
+        return _resolve_finish(s, land(gt(sample_lum(2, pos()), 0.5), found))
 
     return Program(result)
+
+
+def _pass_resolve_loop():
+    k, s, go, p, bf, ta, n, i0, tf = (Var("k", F1), Var("s", F4), Var("go", F1), Var("p", F3), Var("bf", F2),
+                                      Var("ta", F4), Var("n", F3), Var("i0", F3), Var("tf", F3))
+
+    def box_init():
+        b, found = box_of(p.get(), 5, 6, 7)
+        return vec(b, flag(found))
+
+    def g():
+        return clamp((p.get() - ta.get().xyz) / frame_a(4).x - 0.5, 1.0, n.get() - 3.0)
+
+    def upd():
+        c = floor(k.get() / 4.0)
+        b = k.get() - c * 4.0
+        t = tf.get()
+        wx = bspline_weights(t.x)
+        wy, wz = _pick(bspline_weights(t.y), b), _pick(bspline_weights(t.z), c)
+        acc = s.get()
+        for a in range(4):
+            cell = i0.get() + vec(a - 1.0, b - 1.0, c - 1.0)
+            acc = acc + sample_col(3, atlas_uv(ta.get().w + lin3(cell, n.get()))) * (wx[a] * wy * wz)
+        return acc
+
+    return Program(
+        lambda: _resolve_finish(s.get(), on(go.get())),
+        init=[(p, lambda: sample_col(1, pos()).xyz), (bf, box_init),
+              (go, lambda: flag(land(gt(sample_lum(2, pos()), 0.5), on(bf.get().y)))),
+              (ta, lambda: sample_col(8, box_uv(bf.get().x, 0.0))),
+              (n, lambda: sample_col(8, box_uv(bf.get().x, 1.0)).xyz),
+              (i0, lambda: floor(g())), (tf, lambda: g() - floor(g())),
+              (s, lambda: const(0.0, 4)), (k, lambda: const(0.0))],
+        cond=lambda: lor(ge(k.get(), 16.0), lt(go.get(), 0.5)),
+        body=[(s, upd), (k, lambda: k.get() + 1.0)],
+        counter=k, max_iter=16 + 8)
 
 
 def levels(b):
@@ -1557,7 +1666,9 @@ class Graph:
             f'<usertag v=""/></rootOutput></rootOutputs></root></graph>')
 
 
-def build():
+def build(fast=True):
+    """The package XML. fast=False builds the plain graph the optimisations are
+    tested against (same output, more work)."""
     g = Graph("world_space_mask_blur", "World Space Mask Blur")
     icon = os.path.join(HERE, "icon", "world_space_mask_blur.png")
     if os.path.exists(icon):
@@ -1651,6 +1762,9 @@ def build():
     for n, (k, j) in enumerate(ref.sort_steps()):
         keys = pp(f"WSB_Sort1 {k}/{j}", pass_sort_step(k, j), [keys], lp, 900 + 30 * (n % 40), 1500 + 120 * (n // 40))
     cells1 = pp("WSB_Cells1", pass_cells(ref.AW, ref.AH), [keys], atl, -650, 600)
+    if fast:
+        sortmap = pp("WSB_SortMap", pass_vox_map(), [sortboxes], atl, -650, 750)
+        sorted_pos = pp("WSB_SortedPos", pass_sorted_copy(), [keys, pack_pos], lp, -650, 450)
 
     # per stroke (Radius / Quality / mask)
     voxfit = pp("WSB_VoxFit", pass_fit(q_budget), [boxes, bounds], one, -1000, 700)
@@ -1659,11 +1773,18 @@ def build():
     voxmap = pp("WSB_VoxMap", pass_vox_map(), [voxboxes], atl, -700, 650)
     pack_mask = pp("WSB_PackMask", pass_pack_mask(), [mask, position, uvmask, pack_pos, coarse, pack_area, size, area_total],
                    lp, -950, 150)
-    grid = pp("WSB_Splat", pass_splat(),
-              [keys, cells1, pack_pos, pack_mask, frame, voxmap, voxboxes, sortboxes, sortfit], atl, -500, 300)
+    splat_in = [keys, cells1, pack_pos, pack_mask, frame, voxmap, voxboxes, sortboxes, sortfit]
+    if fast:
+        near = cells1
+        for axis, name in enumerate("XYZ"):
+            near = pp(f"WSB_Near{name}", pass_near(axis, axis == 0), [near, sortmap, sortboxes, frame, sortfit], atl,
+                      -620 + 40 * axis, 750)
+        sorted_mask = pp("WSB_SortedMask", pass_sorted_copy(), [keys, pack_mask], lp, -650, 150)
+        splat_in += [near, sorted_pos, sorted_mask]
+    grid = pp("WSB_Splat", pass_splat(fast), splat_in, atl, -500, 300)
     for axis, name in enumerate("XYZ"):
         grid = pp(f"WSB_Blur{name}", pass_blur(axis), [grid, frame, voxmap, voxboxes], atl, -380 + 120 * axis, 300)
-    resolve = g.pixel_processor("WSB_Resolve", pass_resolve(),
+    resolve = g.pixel_processor("WSB_Resolve", pass_resolve(fast),
                                 [mask, position, uvmask, grid, frame, coarse, slabx, runtab, voxboxes],
                                 None, color=False, fmt=FMT_16, x=0, y=0)
     g.output("output", "Output", resolve, x=200, y=0)
