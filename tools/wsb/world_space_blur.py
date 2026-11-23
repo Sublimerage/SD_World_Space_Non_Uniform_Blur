@@ -68,7 +68,8 @@ MIN_BLUR_VOXELS = 0.3    # smallest Gaussian sigma of the separable blur, in vox
 VOXELS_PER_SIGMA = 2.5   # bigger blurs use bigger voxels: sigma / h stays <= this ...
 MAX_VOXEL_CELLS = 4.0    # ... until a voxel is this many sort cells wide
 REJECT_CELLS = 2.0     # pack: reads farther than this (in coarse cells) from the patch's
-                       # representative point belong to another surface
+                       # representative point belong to another surface ...
+REJECT_SPACING = 2.0   # ... unless within this x the patch's extent x its texel spacing
 UV_INSIDE = 0.99   # uv-mask threshold for point samples
 KEY_NONE = 8388608.0   # sort key of empty patches (2^23, after every cell id)
 BIG = 1e20
@@ -201,21 +202,25 @@ def _r2(coarse):
     return (REJECT_CELLS * coarse["c"]) ** 2
 
 
-def _taken(position, uv_mask, pack_pos, coarse):
-    """Reads of each patch that count: inside a UV island and near the patch's
-    representative point."""
+def _taken(position, uv_mask, pack_pos, tol2):
+    """Reads of each patch that count: inside a UV island and within the
+    patch's reject distance (tol2, squared, per sample) of its representative
+    point. Farther reads belong to another surface."""
     _, _, su, sv = _patches()
     rep = pack_pos[..., :3]
     valid = sample_nearest(uv_mask, su, sv) > UV_INSIDE
     pos = sample_nearest(position, su, sv)
-    take = valid & (np.sum((pos - rep[:, :, None, :]) ** 2, axis=-1) < _r2(coarse))
+    take = valid & (np.sum((pos - rep[:, :, None, :]) ** 2, axis=-1) < tol2[..., None])
     return take & (pack_pos[..., 3:4] > 0.5), su, sv
 
 
-def texel_area(position, uv_mask, u, v, r2):
-    """3D area of the texel at (u, v): |dP/dx x dP/dy| from neighbouring texels.
-    Each axis uses the forward difference, or the backward one when the forward
-    neighbour is outside the island (or on another surface); 0 if neither works."""
+def texel_diffs(position, uv_mask, u, v, r2):
+    """dP along each texture axis at the texel at (u, v), from its neighbours
+    inside an island: the forward difference, or the backward one, if within
+    the reject distance (r2: farther may be another surface: an island
+    touching this one in UV); if neither is, the shorter of the two (a
+    stretched island, whose texels are far apart in 3D along one axis: v2.0
+    gave those texels no area); 0 if no neighbour is inside an island."""
     hgt, wid = uv_mask.shape
     p = sample_nearest(position, u, v)
 
@@ -225,20 +230,46 @@ def texel_area(position, uv_mask, u, v, r2):
     def diff(du, dv):
         fwd = sample_nearest(position, u + du, v + dv) - p
         bwd = p - sample_nearest(position, u - du, v - dv)
-        fok = (sample_nearest(uv_mask, u + du, v + dv) > UV_INSIDE) & (np.sum(fwd * fwd, -1) < r2)
-        bok = (sample_nearest(uv_mask, u - du, v - dv) > UV_INSIDE) & (np.sum(bwd * bwd, -1) < r2)
-        fok &= inside(u + du, v + dv)                      # off the texture: no neighbour
-        bok &= inside(u - du, v - dv)
-        return np.where(fok[..., None], fwd, np.where(bok[..., None], bwd, 0.0))
-    return np.linalg.norm(np.cross(diff(1.0 / wid, 0.0), diff(0.0, 1.0 / hgt)), axis=-1)
+        fin = (sample_nearest(uv_mask, u + du, v + dv) > UV_INSIDE) & inside(u + du, v + dv)
+        bin_ = (sample_nearest(uv_mask, u - du, v - dv) > UV_INSIDE) & inside(u - du, v - dv)
+        f2, b2 = np.sum(fwd * fwd, -1), np.sum(bwd * bwd, -1)
+        fok, bok = fin & (f2 < r2), bin_ & (b2 < r2)
+        short = np.where(fin & ~(bin_ & (b2 < f2)), 1, np.where(bin_, 2, 0))      # 1: fwd, 2: bwd
+        pick = np.where(fok, 1, np.where(bok, 2, short))
+        return np.where((pick == 1)[..., None], fwd, np.where((pick == 2)[..., None], bwd, 0.0))
+    return diff(1.0 / wid, 0.0), diff(0.0, 1.0 / hgt)
+
+
+def texel_area(position, uv_mask, u, v, r2):
+    """3D area of the texel at (u, v): |dP/dx x dP/dy| (texel_diffs)."""
+    dx, dy = texel_diffs(position, uv_mask, u, v, r2)
+    return np.linalg.norm(np.cross(dx, dy), axis=-1)
+
+
+def reject_tol2(position, uv_mask, pack_pos, coarse):
+    """Per sample, the squared reject distance: REJECT_CELLS coarse cells, or
+    REJECT_SPACING x the patch's extent in texels x its largest texel spacing
+    (|dP/dx| + |dP/dy| over its in-island reads), whichever is larger. A patch
+    on a stretched island spans more 3D distance than a few coarse cells."""
+    _, _, su, sv = _patches()
+    hgt, wid = uv_mask.shape
+    valid = (sample_nearest(uv_mask, su, sv) > UV_INSIDE) & (pack_pos[..., 3:4] > 0.5)
+    dx, dy = texel_diffs(position, uv_mask, su, sv, _r2(coarse))
+    sp = np.linalg.norm(dx, axis=-1) + np.linalg.norm(dy, axis=-1)
+    smax = np.where(valid, sp, 0.0).max(-1)
+    t = max(1.0, max(wid, hgt) / float(PMAX))
+    return np.maximum(_r2(coarse), (REJECT_SPACING * t * smax) ** 2)
 
 
 def pass_pack_area(position, uv_mask, pack_pos, coarse):
-    take, su, sv = _taken(position, uv_mask, pack_pos, coarse)
+    """-> (area, uv share, reject distance^2, 1)."""
+    tol2 = reject_tol2(position, uv_mask, pack_pos, coarse)
+    take, su, sv = _taken(position, uv_mask, pack_pos, tol2)
     a = texel_area(position, uv_mask, su, sv, _r2(coarse))
     out = np.zeros((PMAX, PMAX, 4))
     out[..., 0] = np.where(take, a, 0.0).sum(-1) / (SUB * SUB)
     out[..., 1] = take.sum(-1) / (SUB * SUB)
+    out[..., 2] = tol2
     out[..., 3] = 1.0
     return out
 
@@ -249,7 +280,7 @@ def pass_pack_mask(mask, position, uv_mask, pack_pos, pack_area, coarse, area_to
     is in units of the mean sample area (sum of areas / PMAX^2), so the voxel
     sums, and the "is anything here" test in Resolve, don't depend on the
     mesh's size or units."""
-    take, su, sv = _taken(position, uv_mask, pack_pos, coarse)
+    take, su, sv = _taken(position, uv_mask, pack_pos, pack_area[..., 2])
     m = sample_nearest(mask, su, sv)
     msum = np.where(take, m, 0.0).sum(-1)
     cnt = take.sum(-1)
@@ -477,14 +508,28 @@ def pass_keys1(pack_pos, coarse, boxes, st):
 #   left half  = (h, sigmaBlur / h, K, sigma / h)
 #   right half = (sigma, length per UV, 0, 1)
 #
-# Total blur = tent splat (variance h^2/6) + Gaussian (sigmaBlur) + cubic
-# B-spline lookup (h^2/3), so sigmaBlur^2 = sigma^2 - h^2/2.
+# Total blur = tent splat (variance h^2/6) + Gaussian (sigmaBlur) + quadratic
+# B-spline lookup (h^2/4), so sigmaBlur^2 = sigma^2 - 5 h^2/12.
 # --------------------------------------------------------------------------
 
-def pass_frame(radius, quality, hq, hs, luv):
+# voxel variance (in h^2) of the splat's tent (1/6) plus the final lookup's B-spline
+LOOKUP_SMOOTH = {"cubic": 1.0 / 6.0 + 1.0 / 3.0, "quadratic": 1.0 / 6.0 + 1.0 / 4.0, "linear": 1.0 / 6.0 + 1.0 / 6.0}
+
+
+def quadratic_weights(t):
+    """Quadratic B-spline weights for voxel offsets -1, 0, +1 around the nearest
+    voxel, at t = position - that voxel (-0.5 .. 0.5)."""
+    a, b = 0.5 - t, 0.5 + t
+    return [0.5 * a * a, 0.75 - t * t, 0.5 * b * b]
+
+
+def pass_frame(radius, quality, hq, hs, luv, lookup="quadratic"):
+    """lookup "quadratic" (v2.1): triquadratic B-spline Resolve (variance h^2/4);
+    "cubic" (v2.0): tricubic B-spline (h^2/3); "linear" (a test): trilinear (h^2/6)."""
     sigma = max(radius * luv * 0.5, MIN_SIGMA_VOXELS * hq)
     h = min(max(sigma / VOXELS_PER_SIGMA, hq), max(hq, MAX_VOXEL_CELLS * hs))
-    sb2 = max(sigma * sigma - h * h * 0.5, (MIN_BLUR_VOXELS * h) ** 2)
+    smooth = LOOKUP_SMOOTH[lookup]                      # splat h^2/6 + lookup
+    sb2 = max(sigma * sigma - h * h * smooth, (MIN_BLUR_VOXELS * h) ** 2)
     sg = np.sqrt(sb2) / h
     return dict(h=h, sg=sg, K=ceil_(3.0 * sg), sigma=sigma, sv=sigma / h, luv=luv, hq=hq)
 
@@ -624,7 +669,7 @@ def levels(b, contrast, grow):
 
 
 def pass_resolve(mask, position, uv_mask, vox, vt, frame, coarse, boxes, amount=DITHER, shape_params=None,
-                 strength=1.0):
+                 strength=1.0, lookup="quadratic"):
     hgt, wid = mask.shape
     yy, xx = np.mgrid[0:hgt, 0:wid]
     u, v = (xx + 0.5) / wid, (yy + 0.5) / hgt
@@ -632,16 +677,30 @@ def pass_resolve(mask, position, uv_mask, vox, vt, frame, coarse, boxes, amount=
     b = box_of(p, coarse, boxes)
     bb = np.maximum(b, 0)
     n = vt["dims"][bb]
-    g = np.clip((p - vt["origin"][bb]) / frame["h"] - 0.5, 1.0, n - 3.0)
-    i0 = np.floor(g)
-    t = g - i0
-    w = [bspline_weights(t[..., k]) for k in range(3)]
     s = 0.0
-    for c in range(4):
-        for bi in range(4):
-            for a in range(4):
+    if lookup == "cubic":
+        g = np.clip((p - vt["origin"][bb]) / frame["h"] - 0.5, 1.0, n - 3.0)
+        i0 = np.floor(g)
+        t = g - i0
+        w = [bspline_weights(t[..., k]) for k in range(3)]
+        taps, off = 4, -1.0
+    elif lookup == "quadratic":                         # triquadratic, 27 reads
+        g = np.clip((p - vt["origin"][bb]) / frame["h"] - 0.5, 1.0, n - 2.0)
+        i0 = np.floor(g + 0.5)
+        t = g - i0
+        w = [quadratic_weights(t[..., k]) for k in range(3)]
+        taps, off = 3, -1.0
+    else:                                               # trilinear, 8 reads
+        g = np.clip((p - vt["origin"][bb]) / frame["h"] - 0.5, 0.0, n - 2.0)
+        i0 = np.floor(g)
+        t = g - i0
+        w = [[1.0 - t[..., k], t[..., k]] for k in range(3)]
+        taps, off = 2, 0.0
+    for c in range(taps):
+        for bi in range(taps):
+            for a in range(taps):
                 wt = (w[0][a] * w[1][bi] * w[2][c])[..., None]
-                q = i0 + np.array([a - 1.0, bi - 1.0, c - 1.0])
+                q = i0 + np.array([a + off, bi + off, c + off])
                 idx = np.clip(vt["offset"][bb] + lin(q, n), 0, AW * AH - 1).astype(int)
                 s = s + wt * vox[idx]
     blurred = np.clip(s[..., 0] / np.maximum(s[..., 1], 1e-12), 0.0, 1.0)
@@ -679,7 +738,7 @@ def prepare(position, uv_mask):
 
 
 def world_space_blur(mask, position, uv_mask, radius=0.02, quality=4, stats=None, dither=DITHER,
-                     shape=None, smear=None, mesh=None):
+                     shape=None, smear=None, mesh=None, lookup="quadratic"):
     """Full filter. `radius`: blur radius in UV units (2 sigma, at the mesh's
     average texel density). `quality`: 1..4, the voxel budget (QUALITY).
     `dither`: anti-banding noise, in 8-bit steps. `shape`: None or
@@ -688,7 +747,7 @@ def world_space_blur(mask, position, uv_mask, radius=0.02, quality=4, stats=None
     m = mesh or prepare(position, uv_mask)
     boxes = m["boxes"]
     hq = fit_cell(boxes["lo"], boxes["hi"], boxes["ok"], budget_of(quality), m["c_hi"])
-    frame = pass_frame(radius, quality, hq, m["hs"], m["luv"])
+    frame = pass_frame(radius, quality, hq, m["hs"], m["luv"], lookup)
     vt = grid_table(boxes, frame["h"])
     pack_mask = pass_pack_mask(mask, position, uv_mask, m["pack_pos"], m["pack_area"], m["coarse"], m["area_total"])
     vox = pass_splat(m["pack_pos"], pack_mask, m["sample_box"], vt, frame["h"])
@@ -699,4 +758,4 @@ def world_space_blur(mask, position, uv_mask, radius=0.02, quality=4, stats=None
         stats.update(boxes=int(boxes["ok"].sum()), voxels=float(vt["vol"].sum()), hs=m["hs"],
                      coarse=m["coarse"]["c"])
     strength = smear[2] if (smear is not None and len(smear) > 2) else 1.0
-    return pass_resolve(mask, position, uv_mask, vox, vt, frame, m["coarse"], boxes, dither, shape, strength)
+    return pass_resolve(mask, position, uv_mask, vox, vt, frame, m["coarse"], boxes, dither, shape, strength, lookup)

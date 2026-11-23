@@ -3,7 +3,7 @@
 Bump VERSION below for each release; it goes in the file name and the graph descriptions.
 
 World space version of the Non-Uniform Blur. The mesh is voxelized exactly
-like World Space Mask Blur v2.0, whose passes are reused from tools/wsb/
+like World Space Mask Blur v2.1, whose passes are reused from tools/wsb/
 (vendored, unmodified):
   surface samples -> coarse grid -> boxes around the pieces (slabs along X,
   runs along Z or Y) -> one sort grid and one voxel grid per box, all packed in
@@ -16,7 +16,7 @@ On top of that, this filter:
     anisotropic polygon, radius decaying per pass, scaled by the blur amount)
     in each voxel's tangent plane. Taps read a per-box mip pyramid (Softness)
     and stay inside their box: a tap that leaves it reads empty;
-  * reads the result back at every texel's 3D position (cubic B-spline in the
+  * reads the result back at every texel's 3D position (quadratic B-spline in the
     texel's box).
 Pieces in different boxes never blur into each other.
 
@@ -70,7 +70,7 @@ class DedupEmitter(B.FunctionEmitter):
 
 B.FunctionEmitter = DedupEmitter      # used by B.Graph.pixel_processor
 
-VERSION = '2.0'
+VERSION = '2.1'
 GRAPH_ID = 'world_space_non_uniform_blur'
 OUTPUT_NAME = '%s_v%s.sbs' % (GRAPH_ID, VERSION)
 TAGS = 'filter;blur;non uniform;bokeh;world space'
@@ -179,25 +179,15 @@ def norm_area(slot_area, slot_total, uv):
 
 def texel_cross(uv, S, r2, c):
     """dP/dx x dP/dy at texel uv, with the differences in coarse cells (scale-free).
-    Same neighbour rules as the mask blur's texel_area (slots: 0 position, 1 uv mask)."""
-    p = sample_col(0, uv).xyz
-
-    def inside(q):
-        return land(gt(fmin(q.x, q.y), 0.0), lt(fmax(q.x, q.y), 1.0))
-
-    def diff(step):
-        f, b = uv + step, uv - step
-        fwd = sample_col(0, f).xyz - p
-        bwd = p - sample_col(0, b).xyz
-        fok = land(land(gt(sample_lum(1, f), ref.UV_INSIDE), lt(dot(fwd, fwd), r2)), inside(f))
-        bok = land(land(gt(sample_lum(1, b), ref.UV_INSIDE), lt(dot(bwd, bwd), r2)), inside(b))
-        return select(fok, fwd, select(bok, bwd, const(0.0, 3))) / c
-
-    return cross3(diff(vec(1.0 / S.x, 0.0)), diff(vec(0.0, 1.0 / S.y)))
+    Same neighbour rules as the mask blur's texel_area (B.texel_diffs: forward, else backward
+    within r2, else the shorter in-island neighbour; slots: 0 position, 1 uv mask)."""
+    dx, dy = B.texel_diffs(uv, S, r2)
+    return cross3(dx / c, dy / c)
 
 
-def _patch_loop(result, accs, read, isz_slot, rep_slot, coarse_slot):
-    """loop over the SUB x SUB reads of this sample's patch, like WSB_PackArea.
+def _patch_loop(result, accs, read, isz_slot, rep_slot, area_slot):
+    """loop over the SUB x SUB reads of this sample's patch, like WSB_PackMask: a read counts if
+    it is inside an island and within the sample's reject distance (PackArea.z, v2.1).
     accs: [(Var, update(taken, uv, ctx) -> Ex)]"""
     S = ref.SUB
     i, cell, rep, r2, isz = Var('i', F1), Var('cell', F2), Var('rep', F4), Var('r2', F1), Var('isz', F2)
@@ -209,7 +199,7 @@ def _patch_loop(result, accs, read, isz_slot, rep_slot, coarse_slot):
 
     init = [(isz, lambda: input_size(isz_slot)), (cell, B._cell),
             (rep, lambda: sample_col(rep_slot, (B._cell() + 0.5) / float(ref.PMAX))),
-            (r2, lambda: B._r2(coarse_slot))]
+            (r2, lambda: sample_col(area_slot, pos()).z)]
     body = []
     for var, upd in accs:
         init.append((var, (lambda v=var: const(0.0, B.DIM[v.typ]))))
@@ -222,18 +212,19 @@ def _patch_loop(result, accs, read, isz_slot, rep_slot, coarse_slot):
 
 def pass_pack_normal():
     """WSNB_PackNormal (PMAX^2, mesh only) -> (sum of dP/dx x dP/dy over the reads taken, 1):
-    signed (UV handedness), in coarse-cell units. Slots: 0 position, 1 uv mask, 2 PackPos, 3 Coarse, 4 Size."""
+    signed (UV handedness), in coarse-cell units. Slots: 0 position, 1 uv mask, 2 PackPos, 3 Coarse, 4 Size,
+    5 PackArea."""
     nsum = Var('nsum', F3)
 
     def upd(ok, uv, ctx):
-        return select(ok, texel_cross(uv, ctx['isz'].get(), ctx['r2'].get(), frame_a(3).w), const(0.0, 3))
+        return select(ok, texel_cross(uv, ctx['isz'].get(), B._r2(3), frame_a(3).w), const(0.0, 3))
 
-    return _patch_loop(lambda: vec(nsum.get(), 1.0), [(nsum, upd)], (0, 1), 4, 2, 3)
+    return _patch_loop(lambda: vec(nsum.get(), 1.0), [(nsum, upd)], (0, 1), 4, 2, 5)
 
 
 def pass_pack_vals():
     """WSNB_PackVals (PMAX^2) -> mean (r, g, b, blur amount) of the reads taken.
-    Slots: 0 input, 1 position, 2 uv mask, 3 PackPos, 4 Coarse, 5 Size, 6 blur map."""
+    Slots: 0 input, 1 position, 2 uv mask, 3 PackPos, 4 Coarse, 5 Size, 6 blur map, 7 PackArea."""
     csum, cnt = Var('csum', F4), Var('cnt', F1)
 
     def upd_c(ok, uv, ctx):
@@ -246,7 +237,7 @@ def pass_pack_vals():
         n = cnt.get()
         return select(gt(n, 0.5), csum.get() / fmax(n, 1.0), const(0.0, 4))
 
-    return _patch_loop(result, [(csum, upd_c), (cnt, upd_n)], (1, 2), 5, 3, 4)
+    return _patch_loop(result, [(csum, upd_c), (cnt, upd_n)], (1, 2), 5, 3, 7)
 
 
 # ----------------------------------------------------------------------------
@@ -640,7 +631,76 @@ def dither3(c):
 
 
 def pass_resolve(fast=False):
-    """Tricubic B-spline lookup of the texel's box grid (64 reads), blended with the input by the
+    """Triquadratic B-spline lookup of the texel's box grid around the nearest voxel (27 reads;
+    v2.0 read 64 with a tricubic, as World Space Mask Blur v2.1), blended with the input by the
+    local blur amount, dithered; written as 16 bit. Texels with nothing to blur (outside the UV
+    islands, in no box, or with a black blur map) skip the reads and keep the input.
+
+    `fast` gives the same result with less work: 3 loop steps of 9 reads instead of 27 of 1,
+    added in the same order (z, then y, then x) with the same weights, so the sum is
+    bit-identical."""
+    p, bx, fnd, ta, n = Var('p', F3), Var('bx', F1), Var('fnd', F1), Var('ta', F4), Var('n', F3)
+    i0, tf, al, S, i = Var('i0', F3), Var('tf', F3), Var('al', F1), Var('S', F4), Var('i', F1)
+
+    def g():
+        return clamp((p.get() - ta.get().xyz) / frame_a(4).x - 0.5, 1.0, n.get() - 2.0)
+
+    def quad(t):
+        a, b = 0.5 - t, 0.5 + t
+        return [a * a * 0.5, 0.75 - t * t, b * b * 0.5]
+
+    def al_init():
+        rv = frame_a(10).x
+        ok = land(gt(sample_lum(2, pos()), 0.5), on(fnd.get()))
+        return select(ok, smoothstep01(rv * blur_amount(0, 9, pos()) * 0.5), 0.0)
+
+    init = [(p, lambda: sample_col(1, pos()).xyz),
+            (bx, lambda: box_of(p.get(), 5, 6, 7)[0]), (fnd, lambda: flag(box_of(p.get(), 5, 6, 7)[1])),
+            (ta, lambda: sample_col(8, box_uv(bx.get(), 0.0))), (n, lambda: box_dims(8, bx.get()).xyz),
+            (i0, lambda: floor(g() + 0.5)), (tf, lambda: g() - floor(g() + 0.5)),
+            (al, al_init), (S, lambda: const(0.0, 4)), (i, lambda: const(0.0))]
+
+    def pick(w3, x):
+        return select(lt(x, 0.5), w3[0], select(lt(x, 1.5), w3[1], w3[2]))
+
+    def read(a, b, c, wx, wy, wz):
+        cell = i0.get() + vec(a - 1.0, b - 1.0, c - 1.0)
+        return sample_col(3, atlas_uv(ta.get().w + lin3(cell, n.get()))) * (wx * wy * wz)
+
+    def upd():
+        ii = i.get()
+        c = floor(ii / 9.0)
+        b = floor(ii / 3.0) - c * 3.0
+        a = ii - floor(ii / 3.0) * 3.0
+        t = tf.get()
+        return S.get() + read(a, b, c, pick(quad(t.x), a), pick(quad(t.y), b), pick(quad(t.z), c))
+
+    def upd9():
+        c = i.get()
+        t = tf.get()
+        wx, wy, wz = quad(t.x), quad(t.y), pick(quad(t.z), c)
+        acc = S.get()
+        for b in range(3):
+            for a in range(3):
+                acc = acc + read(float(a), float(b), c, wx[a], wy[b], wz)
+        return acc
+
+    def result():
+        s = S.get()
+        src = sample_col(0, pos())
+        res = s.xyz / fmax(s.w, 1e-12)
+        out = src.xyz + (res - src.xyz) * al.get()
+        ok = land(gt(al.get(), 0.0), gt(s.w, 1e-6))          # s.w is relative to the mean sample area
+        return select(ok, vec(dither3(out), src.w), src)
+
+    steps = 3.0 if fast else 27.0
+    return Program(result, init=init, cond=lambda: lor(ge(i.get(), steps), le(al.get(), 0.0)),
+                   body=[(S, upd9 if fast else upd), (i, lambda: i.get() + 1.0)], counter=i, max_iter=int(steps) + 8)
+
+
+def pass_resolve_cubic(fast=False):
+    """v2.0's final lookup (build(lookup='cubic'), for comparison): tricubic B-spline lookup of the
+    texel's box grid (64 reads), blended with the input by the
     local blur amount, dithered; written as 16 bit. Texels with nothing to blur (outside the UV
     islands, in no box, or with a black blur map) skip the reads and keep the input.
 
@@ -838,7 +898,7 @@ def icon_path():
     return os.path.join(os.path.dirname(HERE), 'docs', 'icon', GRAPH_ID + '.png')
 
 
-def build_colour(fast=True):
+def build_colour(fast=True, lookup='quadratic'):
     g = B.Graph(GRAPH_ID, 'World Space Non Uniform Blur')
     if os.path.exists(icon_path()):
         g.set_icon(icon_path())
@@ -861,7 +921,7 @@ def build_colour(fast=True):
     _, QW, QH = mip_layout()
     qt = (log2(QW), log2(QH))
 
-    # --- mesh only: World Space Mask Blur v2.0, as is ---
+    # --- mesh only: World Space Mask Blur v2.1, as is ---
     size = g.pixel_processor('WSB_Size', B.pass_size(), [position], None, x=-1400, y=600,
                              rel_log2=(B.SIZE_LOG2, B.SIZE_LOG2))
     bounds = pp('WSB_Bounds', B.pass_bounds(), [position, uvmask, size], one, -1250, 500)
@@ -904,10 +964,11 @@ def build_colour(fast=True):
     mipmap = pp('WSNB_MipMap', pass_mip_map(), [mipboxes, voxboxes], qt, -600, 750)
 
     # --- surface normals (mesh + Quality) and the input (colour, blur amount) ---
-    pack_normal = pp('WSNB_PackNormal', pass_pack_normal(), [position, uvmask, pack_pos, coarse, size], lp, -950, 250)
+    pack_normal = pp('WSNB_PackNormal', pass_pack_normal(), [position, uvmask, pack_pos, coarse, size, pack_area],
+                     lp, -950, 250)
     splat_in = [keys, cells1, pack_pos, pack_area, voxfit, voxmap, voxboxes, sortboxes, sortfit, area_total]
-    pack_vals = pp('WSNB_PackVals', pass_pack_vals(), [src, position, uvmask, pack_pos, coarse, size, bmap], lp,
-                   -950, 150)
+    pack_vals = pp('WSNB_PackVals', pass_pack_vals(), [src, position, uvmask, pack_pos, coarse, size, bmap,
+                                                       pack_area], lp, -950, 150)
     if fast:
         # same result, less work: samples in sorted order, and voxels with no surface in reach skip the walk
         sorted_pos = pp('WSNB_SortedPos', pass_sorted_copy(lambda slot, uv: vec(sample_col(slot, uv).xyz,
@@ -941,7 +1002,8 @@ def build_colour(fast=True):
                    fmt=FMT_16F)
         V = pp('WSNB_Pass%d' % (k + 1), pass_blur(k), [V, q, normals, splat, radius, voxmap, voxboxes, mipboxes],
                atl, x0 + 100, 300, fmt=FMT_16F)
-    out = g.pixel_processor('WSNB_Resolve', pass_resolve(fast),
+    resolve = pass_resolve(fast) if lookup == 'quadratic' else pass_resolve_cubic(fast)
+    out = g.pixel_processor('WSNB_Resolve', resolve,
                             [src, position, uvmask, V, voxfit, coarse, slabx, runtab, voxboxes, bmap, radius],
                             None, color=True, fmt=FMT_16, x=-300 + 200 * MAX_PASSES + 200, y=0)
     output_color(g, 'output', 'Output', out, x=-300 + 200 * MAX_PASSES + 400, y=0)
@@ -993,11 +1055,11 @@ def build_grayscale(pkg_uid):
     return graph_xml(g, 'v%s - Grayscale version of World Space Non Uniform Blur (for masks).' % VERSION)
 
 
-def build_xml(fast=True):
+def build_xml(fast=True, lookup='quadratic'):
     """The package XML. fast=False builds the plain graph the speed-ups are tested against
     (same output, more work)."""
     pkg_uid = new_uid()
-    colour, n = build_colour(fast)
+    colour, n = build_colour(fast, lookup)
     gray = build_grayscale(pkg_uid)
     xml = ('<?xml version="1.0" encoding="UTF-8"?><package><identifier v="%s"/><formatVersion v="1.1.0.202302"/>'
            '<updaterVersion v="1.1.0.202302"/><fileUID v="{4f6b2a1e-93c7-4d0a-b8e5-7c2d91a3f604}"/>'
@@ -1007,8 +1069,8 @@ def build_xml(fast=True):
     return xml, n
 
 
-def build(path, fast=True):
-    xml, n = build_xml(fast)
+def build(path, fast=True, lookup='quadratic'):
+    xml, n = build_xml(fast, lookup)
     with open(path, 'w') as f:
         f.write(xml)
     return n

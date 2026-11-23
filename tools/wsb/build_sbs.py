@@ -40,7 +40,7 @@ DIM = {F1: 1, F2: 2, F3: 3, F4: 4}
 FTYPE = {1: F1, 2: F2, 3: F3, 4: F4}
 
 # Shown in Designer / Painter for every generated graph
-VERSION = "2.0"
+VERSION = "2.1"
 RADIUS_DEFAULT = 0.02
 OUTPUT_NAME = f"world_space_mask_blur_v{VERSION}.sbs"
 AUTHOR = "Doru Bogdan"
@@ -585,7 +585,7 @@ def pass_fit(budget):
         counter=it, max_iter=ref.FIT_STEPS * (NB() + 1) + 8)
 
 
-def pass_frame():
+def pass_frame(lookup="quadratic"):
     """WSB_Frame (16 x 16, Radius / Quality): left (h, sigmaBlur/h, K, sigma/h),
     right (sigma, length per UV, 0, 1). Slots: 0 AreaTotal, 1 VoxFit, 2 SortFit, 3 Size."""
     def result():
@@ -595,7 +595,8 @@ def pass_frame():
         hq, hs = frame_a(1).x, frame_a(2).x
         sigma = fmax(param("radius") * luv * 0.5, hq * ref.MIN_SIGMA_VOXELS)
         h = fmin(fmax(sigma / ref.VOXELS_PER_SIGMA, hq), fmax(hq, hs * ref.MAX_VOXEL_CELLS))
-        sb2 = fmax(sigma * sigma - h * h * 0.5, h * h * (ref.MIN_BLUR_VOXELS ** 2))
+        smooth = ref.LOOKUP_SMOOTH[lookup]                       # splat h^2/6 + the lookup's
+        sb2 = fmax(sigma * sigma - h * h * smooth, h * h * (ref.MIN_BLUR_VOXELS ** 2))
         sg = fsqrt(sb2) / h
         return select(lt(pos().x, 0.5), vec(h, sg, fceil(sg * 3.0), sigma / h), vec(sigma, luv, 0.0, 1.0))
     return Program(result)
@@ -652,7 +653,8 @@ def pass_pack_pos():
 
 
 def _taken(uv, rep, r2, slot_pos, slot_uvm):
-    """Does read `uv` (texel centre) count: inside an island and near rep?"""
+    """Does read `uv` (texel centre) count: inside an island and within the
+    sample's reject distance (r2, squared) of rep?"""
     dp = sample_col(slot_pos, uv).xyz - rep.xyz
     return land(land(gt(sample_lum(slot_uvm, uv), ref.UV_INSIDE), lt(dot(dp, dp), r2)), gt(rep.w, 0.5))
 
@@ -662,9 +664,10 @@ def _r2(slot_coarse):
     return rr * rr
 
 
-def texel_area(uv, S, r2):
-    """3D area of the texel at uv (texel centre): |dP/dx x dP/dy| from neighbours,
-    forward difference, else backward, else 0 (slots: 0 position, 1 uv mask)."""
+def texel_diffs(uv, S, r2):
+    """dP along x and y at the texel at uv (texel centre), as ref.texel_diffs:
+    forward, else backward difference within r2, else the shorter in-island
+    one, else 0 (slots: 0 position, 1 uv mask)."""
     p = sample_col(0, uv).xyz
 
     def inside(q):
@@ -674,45 +677,71 @@ def texel_area(uv, S, r2):
         f, b = uv + step, uv - step
         fwd = sample_col(0, f).xyz - p
         bwd = p - sample_col(0, b).xyz
-        fok = land(land(gt(sample_lum(1, f), ref.UV_INSIDE), lt(dot(fwd, fwd), r2)), inside(f))
-        bok = land(land(gt(sample_lum(1, b), ref.UV_INSIDE), lt(dot(bwd, bwd), r2)), inside(b))
-        return select(fok, fwd, select(bok, bwd, const(0.0, 3)))
+        fin = land(gt(sample_lum(1, f), ref.UV_INSIDE), inside(f))
+        bin_ = land(gt(sample_lum(1, b), ref.UV_INSIDE), inside(b))
+        f2, b2 = dot(fwd, fwd), dot(bwd, bwd)
+        fok, bok = land(fin, lt(f2, r2)), land(bin_, lt(b2, r2))
+        short = select(land(fin, lnot(land(bin_, lt(b2, f2)))), fwd, select(bin_, bwd, const(0.0, 3)))
+        return select(fok, fwd, select(bok, bwd, short))
 
-    dx = diff(vec(1.0 / S.x, 0.0))
-    dy = diff(vec(0.0, 1.0 / S.y))
+    return diff(vec(1.0 / S.x, 0.0)), diff(vec(0.0, 1.0 / S.y))
+
+
+def texel_area(uv, S, r2):
+    """3D area of the texel at uv: |dP/dx x dP/dy| (texel_diffs)."""
+    dx, dy = texel_diffs(uv, S, r2)
     c = dx[1, 2, 0] * dy[2, 0, 1] - dx[2, 0, 1] * dy[1, 2, 0]       # cross product
     return fsqrt(dot(c, c))
 
 
 def pass_pack_area():
-    """WSB_PackArea (PMAX^2, mesh only) -> (area, uv share, 0, 1).
+    """WSB_PackArea (PMAX^2, mesh only) -> (area, uv share, reject distance^2, 1).
+    Two rounds over the patch's reads: the first finds its largest texel
+    spacing, which sets the reject distance (ref.reject_tol2); the second adds
+    up the area of the reads within it.
     Slots: 0 position, 1 uv mask, 2 PackPos, 3 Coarse, 4 Size."""
     S = ref.SUB
-    i, cell, rep, r2, isz, a = Var("i", F1), Var("cell", F2), Var("rep", F4), Var("r2", F1), Var("isz", F2), \
-        Var("a", F1)
-    cnt = Var("cnt", F1)
+    n = float(S * S)
+    i, cell, rep, isz, a = Var("i", F1), Var("cell", F2), Var("rep", F4), Var("isz", F2), Var("a", F1)
+    cnt, smax = Var("cnt", F1), Var("smax", F1)
 
-    def take_and_uv():
-        uv = snap(_sub_uv(cell.get(), i.get()), isz.get())
-        return _taken(uv, rep.get(), r2.get(), 0, 1), uv
+    def read_uv():
+        k = select(lt(i.get(), n), i.get(), i.get() - n)
+        return snap(_sub_uv(cell.get(), k), isz.get())
+
+    def tol2():
+        t = fmax(fmax(isz.get().x, isz.get().y) / float(ref.PMAX), 1.0)
+        d = smax.get() * t * ref.REJECT_SPACING
+        return fmax(_r2(3), d * d)
+
+    def upd_smax():
+        uv = read_uv()
+        dx, dy = texel_diffs(uv, isz.get(), _r2(3))
+        sp = fsqrt(dot(dx, dx)) + fsqrt(dot(dy, dy))
+        ok = land(lt(i.get(), n), land(gt(sample_lum(1, uv), ref.UV_INSIDE), gt(rep.get().w, 0.5)))
+        return select(ok, fmax(smax.get(), sp), smax.get())
+
+    def second():
+        uv = read_uv()
+        return land(ge(i.get(), n), _taken(uv, rep.get(), tol2(), 0, 1)), uv
 
     def upd_a():
-        ok, uv = take_and_uv()
-        return a.get() + select(ok, texel_area(uv, isz.get(), r2.get()), 0.0)
+        ok, uv = second()
+        return a.get() + select(ok, texel_area(uv, isz.get(), _r2(3)), 0.0)
 
     def upd_cnt():
-        ok, _ = take_and_uv()
+        ok, _ = second()
         return cnt.get() + select(ok, 1.0, 0.0)
 
-    n = float(S * S)
     return Program(
-        lambda: vec(a.get() / n, cnt.get() / n, 0.0, 1.0),
+        lambda: vec(a.get() / n, cnt.get() / n, tol2(), 1.0),
         init=[(isz, lambda: input_size(4)), (cell, _cell),
               (rep, lambda: sample_col(2, (_cell() + 0.5) / float(ref.PMAX))),
-              (r2, lambda: _r2(3)), (a, lambda: const(0.0)), (cnt, lambda: const(0.0)), (i, lambda: const(0.0))],
-        cond=lambda: ge(i.get(), n),
-        body=[(a, upd_a), (cnt, upd_cnt), (i, lambda: i.get() + 1.0)],
-        counter=i, max_iter=S * S + 8)
+              (smax, lambda: const(0.0)), (a, lambda: const(0.0)), (cnt, lambda: const(0.0)),
+              (i, lambda: const(0.0))],
+        cond=lambda: ge(i.get(), 2.0 * n),
+        body=[(smax, upd_smax), (a, upd_a), (cnt, upd_cnt), (i, lambda: i.get() + 1.0)],
+        counter=i, max_iter=2 * S * S + 8)
 
 
 def pass_pack_mask():
@@ -745,7 +774,7 @@ def pass_pack_mask():
         result,
         init=[(isz, lambda: input_size(6)), (cell, _cell),
               (rep, lambda: sample_col(3, (_cell() + 0.5) / float(ref.PMAX))),
-              (r2, lambda: _r2(4)),
+              (r2, lambda: sample_col(5, pos()).z),
               (msum, lambda: const(0.0)), (cnt, lambda: const(0.0)), (i, lambda: const(0.0))],
         cond=lambda: ge(i.get(), n),
         body=[(msum, upd_msum), (cnt, upd_cnt), (i, lambda: i.get() + 1.0)],
@@ -1432,8 +1461,9 @@ def _pick(ws, i):
 
 
 def pass_resolve(fast=True):
-    """Tricubic B-spline lookup of the texel's box grid (64 texel-center
-    samples), dithered against 8-bit banding; written as 16 bit.
+    """v2.0's Resolve, kept for comparison builds: tricubic B-spline lookup of
+    the texel's box grid (64 texel-center samples), dithered against 8-bit
+    banding; written as 16 bit.
     Slots: 0 mask, 1 position, 2 uv mask, 3 blurred grid, 4 Frame, 5 Coarse,
     6 SlabX, 7 RunTab, 8 VoxBoxes.
 
@@ -1463,6 +1493,101 @@ def pass_resolve(fast=True):
         return _resolve_finish(s, land(gt(sample_lum(2, pos()), 0.5), found))
 
     return Program(result)
+
+
+def _pass_resolve_trilinear():
+    """Test build: trilinear lookup (8 reads, 2 steps of 4, in the reference's order);
+    texels outside the islands or in no box skip it."""
+    k, s, go, p, bf, ta, n, i0, tf = (Var("k", F1), Var("s", F4), Var("go", F1), Var("p", F3), Var("bf", F2),
+                                      Var("ta", F4), Var("n", F3), Var("i0", F3), Var("tf", F3))
+
+    def box_init():
+        b, found = box_of(p.get(), 5, 6, 7)
+        return vec(b, flag(found))
+
+    def g():
+        return clamp((p.get() - ta.get().xyz) / frame_a(4).x - 0.5, 0.0, n.get() - 2.0)
+
+    def upd():
+        c = k.get()
+        t = tf.get()
+        wx = [1.0 - t.x, t.x]
+        wy = [1.0 - t.y, t.y]
+        wz = select(lt(c, 0.5), 1.0 - t.z, t.z)
+        acc = s.get()
+        for b in range(2):
+            for a in range(2):
+                cell = i0.get() + vec(float(a), float(b), c)
+                acc = acc + sample_col(3, atlas_uv(ta.get().w + lin3(cell, n.get()))) * (wx[a] * wy[b] * wz)
+        return acc
+
+    return Program(
+        lambda: _resolve_finish(s.get(), on(go.get())),
+        init=[(p, lambda: sample_col(1, pos()).xyz), (bf, box_init),
+              (go, lambda: flag(land(gt(sample_lum(2, pos()), 0.5), on(bf.get().y)))),
+              (ta, lambda: sample_col(8, box_uv(bf.get().x, 0.0))),
+              (n, lambda: sample_col(8, box_uv(bf.get().x, 1.0)).xyz),
+              (i0, lambda: floor(g())), (tf, lambda: g() - floor(g())),
+              (s, lambda: const(0.0, 4)), (k, lambda: const(0.0))],
+        cond=lambda: lor(ge(k.get(), 2.0), lt(go.get(), 0.5)),
+        body=[(s, upd), (k, lambda: k.get() + 1.0)],
+        counter=k, max_iter=2 + 8)
+
+
+def _pass_resolve_triquadratic():
+    """WSB_Resolve: triquadratic B-spline lookup of the texel's box grid around
+    the nearest voxel (27 texel-centre reads, 3 steps of 9, in the reference's
+    order), dithered against 8-bit banding; written as 16 bit. Smooth across
+    voxel faces like v2.0's tricubic (64 reads); trilinear (8) leaves creases
+    there. Texels outside the islands or in no box skip the reads (they keep
+    the input). Slots as in pass_resolve."""
+    k, s, go, p, bf, ta, n, i0, tf = (Var("k", F1), Var("s", F4), Var("go", F1), Var("p", F3), Var("bf", F2),
+                                      Var("ta", F4), Var("n", F3), Var("i0", F3), Var("tf", F3))
+
+    def box_init():
+        b, found = box_of(p.get(), 5, 6, 7)
+        return vec(b, flag(found))
+
+    def g():
+        return clamp((p.get() - ta.get().xyz) / frame_a(4).x - 0.5, 1.0, n.get() - 2.0)
+
+    def quad(t):
+        a, b = 0.5 - t, 0.5 + t
+        return [a * a * 0.5, 0.75 - t * t, b * b * 0.5]
+
+    def upd():
+        c = k.get()
+        t = tf.get()
+        wx, wy, wzs = quad(t.x), quad(t.y), quad(t.z)
+        wz = select(lt(c, 0.5), wzs[0], select(lt(c, 1.5), wzs[1], wzs[2]))
+        acc = s.get()
+        for b in range(3):
+            for a in range(3):
+                cell = i0.get() + vec(a - 1.0, b - 1.0, c - 1.0)
+                acc = acc + sample_col(3, atlas_uv(ta.get().w + lin3(cell, n.get()))) * (wx[a] * wy[b] * wz)
+        return acc
+
+    return Program(
+        lambda: _resolve_finish(s.get(), on(go.get())),
+        init=[(p, lambda: sample_col(1, pos()).xyz), (bf, box_init),
+              (go, lambda: flag(land(gt(sample_lum(2, pos()), 0.5), on(bf.get().y)))),
+              (ta, lambda: sample_col(8, box_uv(bf.get().x, 0.0))),
+              (n, lambda: sample_col(8, box_uv(bf.get().x, 1.0)).xyz),
+              (i0, lambda: floor(g() + 0.5)), (tf, lambda: g() - floor(g() + 0.5)),
+              (s, lambda: const(0.0, 4)), (k, lambda: const(0.0))],
+        cond=lambda: lor(ge(k.get(), 3.0), lt(go.get(), 0.5)),
+        body=[(s, upd), (k, lambda: k.get() + 1.0)],
+        counter=k, max_iter=3 + 8)
+
+
+def resolve_pass(lookup="quadratic", fast=True):
+    if lookup == "quadratic":
+        return _pass_resolve_triquadratic()
+    return pass_resolve(fast) if lookup == "cubic" else _pass_resolve_trilinear()
+
+
+LOOKUP_DESC = {"cubic": "v2.0's tricubic final lookup, 64 reads instead of 27",
+               "linear": "trilinear final lookup, 8 reads instead of 27"}
 
 
 def _pass_resolve_loop():
@@ -1666,10 +1791,15 @@ class Graph:
             f'<usertag v=""/></rootOutput></rootOutputs></root></graph>')
 
 
-def build(fast=True):
+def build(fast=True, lookup="quadratic"):
     """The package XML. fast=False builds the plain graph the optimisations are
-    tested against (same output, more work)."""
-    g = Graph("world_space_mask_blur", "World Space Mask Blur")
+    tested against (same output, more work). lookup: the final lookup,
+    "quadratic" (the filter, 27 reads), or for comparisons "cubic" (v2.0's,
+    64 reads) or "linear" (trilinear, 8 reads), built as a separate test filter."""
+    if lookup == "quadratic":
+        g = Graph("world_space_mask_blur", "World Space Mask Blur")
+    else:                                     # a separate filter in Painter's shelf, for side-by-side tests
+        g = Graph(f"world_space_mask_blur_{lookup}_lookup", f"World Space Mask Blur ({lookup} lookup test)")
     icon = os.path.join(HERE, "icon", "world_space_mask_blur.png")
     if os.path.exists(icon):
         g.set_icon(icon)
@@ -1768,7 +1898,7 @@ def build(fast=True):
 
     # per stroke (Radius / Quality / mask)
     voxfit = pp("WSB_VoxFit", pass_fit(q_budget), [boxes, bounds], one, -1000, 700)
-    frame = pp("WSB_Frame", pass_frame(), [area_total, voxfit, sortfit, size], one, -900, 650)
+    frame = pp("WSB_Frame", pass_frame(lookup), [area_total, voxfit, sortfit, size], one, -900, 650)
     voxboxes = pp("WSB_VoxBoxes", pass_grid_table(lambda: frame_a(1).x), [boxes, frame], boxt, -800, 650)
     voxmap = pp("WSB_VoxMap", pass_vox_map(), [voxboxes], atl, -700, 650)
     pack_mask = pp("WSB_PackMask", pass_pack_mask(), [mask, position, uvmask, pack_pos, coarse, pack_area, size, area_total],
@@ -1784,7 +1914,7 @@ def build(fast=True):
     grid = pp("WSB_Splat", pass_splat(fast), splat_in, atl, -500, 300)
     for axis, name in enumerate("XYZ"):
         grid = pp(f"WSB_Blur{name}", pass_blur(axis), [grid, frame, voxmap, voxboxes], atl, -380 + 120 * axis, 300)
-    resolve = g.pixel_processor("WSB_Resolve", pass_resolve(fast),
+    resolve = g.pixel_processor("WSB_Resolve", resolve_pass(lookup, fast),
                                 [mask, position, uvmask, grid, frame, coarse, slabx, runtab, voxboxes],
                                 None, color=False, fmt=FMT_16, x=0, y=0)
     g.output("output", "Output", resolve, x=200, y=0)
@@ -1792,6 +1922,8 @@ def build(fast=True):
     desc = (f"v{VERSION} - Blurs a mask in 3D using Painter's mesh position, so the blur is continuous across UV "
             "seams. Pieces laid out apart get their own voxel grids, so spreading them out doesn't coarsen the "
             "blur, and they don't blur into each other. Radius is in UV units.")
+    if lookup != "quadratic":
+        desc = desc.replace(f"v{VERSION} - ", f"v{VERSION} test build, {LOOKUP_DESC[lookup]} - ")
     return ('<?xml version="1.0" encoding="UTF-8"?><package><identifier v="Unsaved Package"/>'
             '<formatVersion v="1.1.0.202302"/><updaterVersion v="1.1.0.202302"/>'
             '<fileUID v="{7d3c1f0e-5a8b-4c61-9f2e-3b7a1d9c4e52}"/><versionUID v="0"/>'
@@ -1804,9 +1936,14 @@ def build(fast=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-o", "--output", default=os.path.join(HERE, OUTPUT_NAME))
+    ap.add_argument("-o", "--output")
+    ap.add_argument("--lookup", choices=("quadratic", "cubic", "linear"), default="quadratic",
+                    help="the final lookup; cubic (v2.0's) or linear build a separate test filter")
     args = ap.parse_args()
-    xml = build()
+    if args.output is None:
+        name = OUTPUT_NAME if args.lookup == "quadratic" else OUTPUT_NAME.replace(".sbs", f"_{args.lookup}_lookup_test.sbs")
+        args.output = os.path.join(HERE, name)
+    xml = build(lookup=args.lookup)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(xml)
     print(f"wrote {os.path.normpath(args.output)} ({len(xml) // 1024} KB)")

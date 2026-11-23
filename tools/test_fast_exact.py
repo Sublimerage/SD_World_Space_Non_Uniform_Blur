@@ -1,16 +1,19 @@
-"""The speed-ups (build(fast=True), what ships) must change no output pixel.
+"""The speed-ups (build(fast=True), what ships) must change no output pixel, and v2.1's
+stretched-island fix must change nothing on meshes without stretched islands.
 
-Builds the graph with and without them (and the released v2.0 builder from git, when
-available) at reduced table sizes and runs both on many cases: box, cube-mapped sphere,
+Builds v2.1 with and without the speed-ups, v2.1 with v2.0's tricubic final lookup
+(lookup='cubic'), and v2.0 as released (from git, when available), at reduced table sizes,
+and runs them on many cases: box, cube-mapped sphere,
 the box at 1/1000 scale, kit layouts (4 pieces, 6 in a row, a column along Z, a stack
 along Y), every Quality, Intensity from small to large, voxels from 1x to over 4x a sort
 cell, and each option (Anisotropy, Blades, Softness, Samples, Angle, Reference Axis, blur
 map off / from the input / inverted, Dither), plus the grayscale graph. Every output pixel
-must be exactly equal (max |fast - plain| == 0). The difference maps are saved in a sheet.
+must be exactly equal (max |fast - plain| == 0), and v2.1 with v2.0's lookup must equal v2.0
+(only the final lookup changed elsewhere; its mean difference is printed). The fast - plain
+difference maps are saved in a sheet.
 
     python3 tools/test_fast_exact.py [out_dir]
 """
-import importlib.util
 import os
 import subprocess
 import sys
@@ -36,33 +39,39 @@ SMALL = TV.SMALL
 BIG_SORT = (32, 128, 128, 32, 32, 32, 4, 4, {1: 8, 2: 12, 3: 16}, 32, 4, 8)
 
 
-def released_builder():
-    """tools/build_wsnub.py as released in v2.0 (commit dde603a), if git has it"""
+RELEASE = 'dde603a'        # v2.0 as released (its own builder and vendored tools/wsb)
+
+
+def released_sbs(config, out):
+    """build v2.0 as released at `config`, in a separate process (its vendored modules differ
+    from today's), or None if git doesn't have it"""
+    root = tempfile.mkdtemp()
     try:
-        src = subprocess.run(['git', '-C', os.path.dirname(HERE), 'show', 'dde603a:tools/build_wsnub.py'],
-                             capture_output=True, text=True, check=True).stdout
+        for f in ('tools/build_wsnub.py', 'tools/wsb/build_sbs.py', 'tools/wsb/world_space_blur.py'):
+            src = subprocess.run(['git', '-C', os.path.dirname(HERE), 'show', '%s:%s' % (RELEASE, f)],
+                                 capture_output=True, text=True, check=True).stdout
+            os.makedirs(os.path.dirname(os.path.join(root, f)), exist_ok=True)
+            with open(os.path.join(root, f), 'w') as fh:
+                fh.write(src)
     except Exception:
         return None
-    path = os.path.join(tempfile.mkdtemp(), 'build_wsnub_v20.py')
-    with open(path, 'w') as f:
-        f.write(src.replace("HERE = os.path.dirname(os.path.abspath(__file__))", "HERE = %r" % HERE))
-    spec = importlib.util.spec_from_file_location('build_wsnub_v20', path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    code = ('import sys; sys.path.insert(0, %r); sys.path.insert(0, %r); import world_space_blur as ref; '
+            'ref.configure(*%r); import build_wsnub as W; W.build(%r)'
+            % (os.path.join(root, 'tools', 'wsb'), os.path.join(root, 'tools'), tuple(config), out))
+    subprocess.run([sys.executable, '-c', code], check=True, cwd=root)
+    return out
 
 
 def build_all(config):
     ref.configure(*config)
     d = tempfile.mkdtemp()
     out = {}
-    for name, fast in (('fast', True), ('plain', False)):
+    for name, fast, lookup in (('fast', True, 'quadratic'), ('plain', False, 'quadratic'),
+                               ('cubic', False, 'cubic')):
         out[name] = os.path.join(d, name + '.sbs')
-        W.build(out[name], fast=fast)
-    rel = released_builder()
-    if rel is not None:
+        W.build(out[name], fast=fast, lookup=lookup)
+    if released_sbs(config, os.path.join(d, 'v20.sbs')) is not None:
         out['v2.0'] = os.path.join(d, 'v20.sbs')
-        rel.build(out['v2.0'])
     return out
 
 
@@ -127,10 +136,12 @@ def main(out_dir):
             got = {k: run(p, S[scene], prm, gray) for k, p in paths.items()}
             d = np.abs(got['fast'] - got['plain'])
             same = d.max() == 0.0
-            rel = '' if 'v2.0' not in got else ('  plain == released v2.0: %s' %
-                                                ('yes' if np.abs(got['plain'] - got['v2.0']).max() == 0.0 else 'NO'))
-            if 'v2.0' in got and np.abs(got['plain'] - got['v2.0']).max() != 0.0:
-                same = False
+            rel = ''
+            if 'v2.0' in got:
+                fix_only = np.abs(got['cubic'] - got['v2.0']).max()
+                rel = '  v2.1 with v2.0 lookup == v2.0: %s  v2.1 vs v2.0 mean %.1e' % (
+                    'yes' if fix_only == 0.0 else 'NO (%.1e)' % fix_only, np.abs(got['fast'] - got['v2.0']).mean())
+                same &= fix_only == 0.0
             changed = np.abs(got['fast'] - run(paths['fast'], S[scene], dict(prm, intensity=0.0), gray)).max()
             n += 1
             ok &= same

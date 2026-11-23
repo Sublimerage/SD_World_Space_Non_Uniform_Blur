@@ -3,9 +3,9 @@
 A Substance Designer / Substance Painter filter that does the **Non-Uniform Blur**
 (bokeh blur scaled by a blur map, with Samples / Intensity / Anisotropy / Blades / Angle)
 **in 3D, using the mesh position**, so the result is continuous across UV seams.
-It is built on the same voxelization as *World Space Mask Blur v2.0*.
+It is built on the same voxelization as *World Space Mask Blur v2.1*.
 
-`world_space_non_uniform_blur_v2.0.sbs` (**version 2.0**, set by `VERSION` in `tools/build_wsnub.py`; it goes in the file name and the graph descriptions) contains two graphs:
+`world_space_non_uniform_blur_v2.1.sbs` (**version 2.1**, set by `VERSION` in `tools/build_wsnub.py`; it goes in the file name and the graph descriptions) contains two graphs:
 
 | Graph | Use |
 |---|---|
@@ -72,10 +72,10 @@ voxel size) and at Intensity 8 washes it out; v2.0 blurs both by the right amoun
 
 ## How it works
 
-1. **Voxelization** (World Space Mask Blur v2.0, vendored in `tools/wsb/` and used as is): 512×512 surface samples with area weights, a coarse sort to find the boxes, a fine sort of the samples into each box's cells.
+1. **Voxelization** (World Space Mask Blur v2.1, vendored in `tools/wsb/` and used as is): 512×512 surface samples with area weights, a coarse sort to find the boxes, a fine sort of the samples into each box's cells.
 2. **Splats**: each voxel gathers the samples of its box next to it (tent weights). One splat stores the surface normal (the dominant eigenvector of the normal tensor, so mirrored UV islands don't cancel out; mesh only), the other `(colour·w, blur amount·w)` (per stroke). Sample areas are relative to the mesh's mean sample area, so nothing depends on its size or units.
 3. **Non-uniform passes** (up to 16): each voxel averages its centre and `Blades` taps. The taps sit on the 2D Non-Uniform Blur's ellipse (same angles, inner rotation, anisotropy and radius decay `exp(-2k·√(-ln 0.001)/N)` with `N = min(Samples, ⌈Intensity·π⌉)` passes), placed in the voxel's tangent plane and scaled by the voxel's blur amount. Taps read a 5-level per-box voxel mip pyramid, which is what Softness controls, so taps that leave the surface still find it.
-4. **Resolve**: finds each texel's box, then a cubic B-spline lookup in it at the texel's position. It is blended with the original texel where the local radius is below about 2 voxels, so unblurred areas stay sharp.
+4. **Resolve**: finds each texel's box, then a quadratic B-spline lookup in it at the texel's position (27 voxels around the nearest one; v2.0 used a cubic one, 64 voxels). It is blended with the original texel where the local radius is below about 2 voxels, so unblurred areas stay sharp.
 
 ![interpreter renders: sphere with blur map, box with anisotropy, box with 8 samples (top: input, bottom: output)](docs/interpreter_preview.png)
 
@@ -113,8 +113,8 @@ Ported from World Space Mask Blur (`ef8f9ed`). Each only skips work whose result
 known; `tools/build_wsnub.py` builds them by default (`build(fast=True)`), and `fast=False`
 builds the plain graph they're tested against.
 
-1. **Resolve**: the 64 voxel reads run in 16 loop steps of 4 (instead of 64 of 1), added in
-   the same order with the same weights. Texels with nothing to blur (outside the UV islands,
+1. **Resolve**: the 27 voxel reads run in 3 loop steps of 9 (instead of 27 of 1; in v2.0, 64 reads
+   in 16 steps of 4), added in the same order with the same weights. Texels with nothing to blur (outside the UV islands,
    in no box, or with a black blur map) already skipped the reads and keep the input.
 2. **Normals splat**: per Quality change, `WSB_NearX/Y/Z` mark sort cells with an occupied cell
    within `ceil(h / hs) + 1` cells (more than a voxel's walk reaches); voxels whose cell isn't
@@ -136,21 +136,50 @@ The per-stroke gain is small because, unlike in the mask blur, most of this filt
 work is in the bokeh passes and their mips (about 75 % of the reads), which these don't touch;
 the biggest saving is in the normals splat, which reruns only when the mesh or Quality changes.
 
-**Exactness**: `tools/test_fast_exact.py` runs the fast and the plain graph on 40 cases at
+**Exactness**: `tools/test_fast_exact.py` runs the fast and the plain graph on 38 cases at
 reduced sizes (box, sphere, box at 1/1000, kit layouts: 4 pieces, 6 in a row, a column along Z, a
 stack along Y; every Quality; Intensity 2 – 48; voxels 1× – 47× a sort cell; Anisotropy, Angle,
 Blades 3 / 9, Softness 0 / 1, Samples 1 / 16, Reference Axis, blur map off / from the input /
 inverted, Dither; the grayscale graph) and requires every output pixel to be exactly equal: all
-40 are, and the plain graph also equals the released v2.0 (`dde603a`) bit for bit. The difference
-maps are all black (`docs/images/fast_vs_plain_diff.png`). At the real table sizes, the three
-scenes above also give 0 differing pixels (`tools/bench_v2.py` on both builds).
+38 are. It also builds v2.1 with v2.0's cubic lookup (`build(lookup='cubic')`), which equals the
+released v2.0 (`dde603a`, built from its own sources) bit for bit on every case: the
+stretched-island fix changes nothing on these meshes. The difference maps are all black
+(`docs/images/fast_vs_plain_diff.png`). At the real table sizes, the three scenes above also gave 0
+differing pixels between the fast and plain v2.0 (`tools/bench_v2.py` on both builds).
+
+### v2.1: stretched UV islands and a cheaper final lookup
+
+From World Space Mask Blur v2.1. At 2048², Quality 4, Intensity 10 (`tools/bench_v2.py`,
+v2.0 → v2.1):
+
+| Scene | Per stroke: reads | node evals | Once per mesh or Quality: reads | node evals |
+|---|---|---|---|---|
+| Sphere | 1.18 → 1.13 G (−4 %) | 38.4 → 34.7 G (−10 %) | 0.86 → 1.02 G | 26.6 → 29.1 G |
+| Kit layout, 4 pieces | 1.35 → 1.27 G (−5 %) | 46.1 → 41.2 G (−11 %) | 1.00 → 1.16 G | 29.9 → 32.5 G |
+| Flat plane | 1.99 → 1.84 G (−8 %) | 76.1 → 66.1 G (−13 %) | 1.36 → 1.52 G | 38.9 → 41.4 G |
+
+* **Per stroke**: the final lookup reads 27 voxels per texel instead of 64. The output moves by a
+  mean of 0.0001 – 0.001 on these scenes (the blur itself changes them by 0.05 – 0.25), the plane
+  stays 0.0013 from the 2D filter, and it's as smooth: the mean second difference of the result
+  is 0.98 – 1.04× v2.0's.
+* **Once per mesh**: about 0.16 G reads more, `WSB_PackArea`'s first round over each sample's
+  reads to find its texel spacing.
+* **Stretched islands** (`tools/test_stretched.py`: a door frame with every face in an equal
+  square UV island, the posts stretched 13:1, at 512², against the same door unwrapped in
+  proportion):
+
+  | | Samples with no area | Post texels left unblurred | Posts: difference to the proportional unwrap |
+  |---|---|---|---|
+  | v2.0 | 44 % | 55 % | 0.22 |
+  | v2.1 | **0 %** | **0 %** | **0.017** (the lintel: 0.013) |
 
 ## Testing
 
 ```
 pip install numpy pillow scipy
 python3 tools/test_v2.py            # reduced sizes, about a minute
-python3 tools/test_fast_exact.py    # speed-ups change no pixel: 40 cases, about 10 minutes
+python3 tools/test_fast_exact.py    # speed-ups change no pixel; v2.1's fix changes nothing elsewhere: 38 cases
+python3 tools/test_stretched.py     # stretched UV islands (door frame) at full size, about 15 minutes
 ```
 
 `tools/sbsinterp.py` is a small numpy interpreter for pixel-processor graphs; the tests run the
@@ -175,15 +204,27 @@ interpreter also runs the original World Space Mask Blur correctly.
 The package is generated by a script; don't edit the `.sbs` by hand:
 
 ```
-python3 tools/build_wsnub.py       # writes world_space_non_uniform_blur_v2.0.sbs (checks Get node types)
+python3 tools/build_wsnub.py       # writes world_space_non_uniform_blur_v2.1.sbs (checks Get node types)
 python3 tools/make_icon.py         # re-renders docs/icon/ (runs the graph; then rebuild to embed)
 ```
 
-`tools/wsb/` holds unmodified copies of World Space Mask Blur v2.0's generator and reference
+`tools/wsb/` holds unmodified copies of World Space Mask Blur v2.1's generator and reference
 (see `tools/wsb/README.md`); update it by copying the files again.
 
 ## Versions
 
+* **2.1**: the World Space Mask Blur v2.1 fixes.
+  * **Fixed: stretched UV islands left unblurred.** On an island much longer in 3D than in UV
+    (a door-frame post packed into a square island, 13:1), at 512² and 1K the texel spacing was
+    larger than the fixed "same surface" distance, so its samples got no area, colour or normal
+    and the island kept the input. Texel differences now fall back to the nearer in-island
+    neighbour, and each sample's reads use a reject distance scaled by its own texel spacing
+    (`WSB_PackArea`, and this filter's `WSNB_PackNormal` / `WSNB_PackVals`). Other meshes are
+    unchanged bit for bit.
+  * **Faster final lookup**: a quadratic B-spline around the nearest voxel (27 reads per texel)
+    instead of the cubic one (64). It's as smooth across voxel faces; the output moves by
+    0.00003–0.005 on average.
+  * Parameters are the same as 2.0. The v2.0 `.sbs` is in the git history (commit `34c95d1`).
 * **2.0**: pieces laid out apart get their own voxel grids (13× finer on a spread-out
   layout) and don't blur into each other; the voxel grid follows each piece's proportions
   (6× finer on a flat piece, 10× closer to the 2D filter there). Quality is a voxel budget
