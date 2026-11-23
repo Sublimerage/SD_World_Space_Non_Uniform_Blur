@@ -5,6 +5,11 @@ A Substance Designer / Substance Painter filter that does the **Non-Uniform Blur
 **in 3D, using the mesh position**, so the result is continuous across UV seams.
 It is built on the same voxelization as *World Space Mask Blur v2.0*.
 
+> **Lite version**: `world_space_non_uniform_blur_lite_v1.0.sbs` does the same blur on 6 axis
+> views of each piece instead of voxels: about 3× less work per paint stroke, but 1.5–14× more
+> once per mesh, and faces a piece hides from itself aren't blurred. See [docs/lite.md](docs/lite.md).
+> (This branch holds Lite; v2.1 is on `claude/nice-gates-3mw7kg`.)
+
 `world_space_non_uniform_blur_v2.0.sbs` (**version 2.0**, set by `VERSION` in `tools/build_wsnub.py`; it goes in the file name and the graph descriptions) contains two graphs:
 
 | Graph | Use |
