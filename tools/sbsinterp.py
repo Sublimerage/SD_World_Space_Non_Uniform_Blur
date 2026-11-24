@@ -205,8 +205,11 @@ class Evaluator:
     def _writeback(self, c, s, idx):
         for k, v in s.vars.items():
             if k not in c.vars:
+                # first set inside the loop: where the loop didn't run the variable was never set.
+                # NaN there, so a graph that reads it and uses the value shows up in the tests
                 shp = (c.n,) + np.shape(v)[1:]
-                c.vars[k] = np.zeros(shp, np.asarray(v).dtype)
+                dt = np.asarray(v).dtype
+                c.vars[k] = np.full(shp, np.nan, dt) if dt.kind == 'f' else np.zeros(shp, dt)
             c.vars[k][idx] = v
 
 
@@ -249,11 +252,13 @@ def param_defaults(graph):
     return out
 
 
-def run_graph(path, graph_id, images, params=None, targets=None, keep=None, verbose=False):
+def run_graph(path, graph_id, images, params=None, targets=None, keep=None, verbose=False, cache=None):
     """Evaluate graph `graph_id` of package `path`.
 
     images: dict input identifier -> numpy image (H,W) or (H,W,4)
     returns dict of outputs (by output identifier) and intermediate results for uids in `keep`.
+    cache: {node uid: image} of results to reuse instead of evaluating those nodes (their STATS
+    entries are left as they are).
     """
     import time
     root = ET.parse(path).getroot()
@@ -263,7 +268,7 @@ def run_graph(path, graph_id, images, params=None, targets=None, keep=None, verb
     entries = {p.find('uid').get('v'): p.find('identifier').get('v') for p in graph.findall('paraminputs/paraminput')}
     outs_by_uid = {o.find('uid').get('v'): o.find('identifier').get('v') for o in graph.findall('graphOutputs/graphoutput')}
     nodes = {n.find('uid').get('v'): n for n in graph.find('compNodes')}
-    res = {}
+    res = dict(cache or {})
     results = {}
 
     def conns(n):
