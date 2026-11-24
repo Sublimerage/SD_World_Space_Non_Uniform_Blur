@@ -5,14 +5,11 @@ A Substance Designer / Substance Painter filter that does the **Non-Uniform Blur
 **in 3D, using the mesh position**, so the result is continuous across UV seams.
 It is built on the same voxelization as *World Space Mask Blur v2.1*.
 
-`world_space_non_uniform_blur_v2.1.sbs` (**version 2.1**, set by `VERSION` in `tools/build_wsnub.py`; it goes in the file name and the graph descriptions) contains two graphs:
+`world_space_non_uniform_blur_v2.1.sbs` (**version 2.1**, set by `VERSION` in `tools/build_wsnub.py`; it goes in the file name and the graph descriptions) contains one graph, `world_space_non_uniform_blur`. Use it on any channel, colour or grayscale,
+and in masks: a grayscale input is read as grey and blurred the same way. (Up to v2.0 there was
+also a separate `_grayscale` graph; it was only this one with a conversion on each side.)
 
-| Graph | Use |
-|---|---|
-| `world_space_non_uniform_blur` | colour input / output (any channel) |
-| `world_space_non_uniform_blur_grayscale` | grayscale input / output (masks) |
-
-Icon (made by `tools/make_icon.py` in the style of the World Space Mask Blur icon, embedded in both graphs): the grey test sphere seen at the corner where three UV islands meet, its seams dashed. Its 3D checker is blurred by the filter itself with a left → right blur map, from crisp to melted, continuous across the seams.
+Icon (made by `tools/make_icon.py` in the style of the World Space Mask Blur icon, embedded in the graph): the grey test sphere seen at the corner where three UV islands meet, its seams dashed. Its 3D checker is blurred by the filter itself with a left → right blur map, from crisp to melted, continuous across the seams.
 
 ![the icon at 256, 128 and 32 px](docs/icon/preview.png)
 
@@ -140,7 +137,7 @@ the biggest saving is in the normals splat, which reruns only when the mesh or Q
 reduced sizes (box, sphere, box at 1/1000, kit layouts: 4 pieces, 6 in a row, a column along Z, a
 stack along Y; every Quality; Intensity 2 – 48; voxels 1× – 47× a sort cell; Anisotropy, Angle,
 Blades 3 / 9, Softness 0 / 1, Samples 1 / 16, Reference Axis, blur map off / from the input /
-inverted, Dither; the grayscale graph) and requires every output pixel to be exactly equal: all
+inverted, Dither; a grayscale input, as in a mask) and requires every output pixel to be exactly equal: all
 38 are. It also builds v2.1 with v2.0's cubic lookup (`build(lookup='cubic')`), which equals the
 released v2.0 (`dde603a`, built from its own sources) bit for bit on every case: the
 stretched-island fix changes nothing on these meshes. The difference maps are all black
@@ -224,6 +221,8 @@ python3 tools/make_icon.py         # re-renders docs/icon/ (runs the graph; then
   * **Faster final lookup**: a quadratic B-spline around the nearest voxel (27 reads per texel)
     instead of the cubic one (64). It's as smooth across voxel faces; the output moves by
     0.00003–0.005 on average.
+  * **One graph instead of two**: the separate grayscale graph is gone. The colour graph works in
+    masks too (checked in Painter) and gives the same result; a mask is read as grey.
   * Parameters are the same as 2.0. The v2.0 `.sbs` is in the git history (commit `34c95d1`).
 * **2.0**: pieces laid out apart get their own voxel grids (13× finer on a spread-out
   layout) and don't blur into each other; the voxel grid follows each piece's proportions

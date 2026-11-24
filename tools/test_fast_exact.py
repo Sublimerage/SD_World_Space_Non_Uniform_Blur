@@ -7,7 +7,7 @@ and runs them on many cases: box, cube-mapped sphere,
 the box at 1/1000 scale, kit layouts (4 pieces, 6 in a row, a column along Z, a stack
 along Y), every Quality, Intensity from small to large, voxels from 1x to over 4x a sort
 cell, and each option (Anisotropy, Blades, Softness, Samples, Angle, Reference Axis, blur
-map off / from the input / inverted, Dither), plus the grayscale graph. Every output pixel
+map off / from the input / inverted, Dither), plus a grayscale input (as in a mask). Every output pixel
 must be exactly equal (max |fast - plain| == 0), and v2.1 with v2.0's lookup must equal v2.0
 (only the final lookup changed elsewhere; its mean difference is printed). The fast - plain
 difference maps are saved in a sheet.
@@ -99,8 +99,8 @@ def run(path, maps, params, gray=False):
     prm.update(params)
     imgs = {'input': col[..., 0] if gray else col, 'mesh_position': pos4,
             'mesh_uv_mask': uvm.astype(np.float32), 'blur_map': bmap}
-    gid = W.GRAPH_ID + ('_grayscale' if gray else '')
-    return SI.run_graph(path, gid, imgs, prm)['output']
+    out = SI.run_graph(path, W.GRAPH_ID, imgs, prm)['output']   # a grayscale input, as in a mask: read as grey
+    return out[..., 0] if gray else out
 
 
 P = dict(intensity=24.0, samples=4.0, quality=3.0)

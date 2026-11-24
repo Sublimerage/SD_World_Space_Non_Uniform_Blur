@@ -6,7 +6,7 @@ A neutral grey cube-mapped sphere seen at the corner where three UV islands
 meet, their seams drawn as fine dashed lines. A few white spots (the mask) sit
 on an arc across the seams. The filter's own Blur Map is a smooth left -> right
 ramp, so the spots go from sharp to fully bokeh-blurred along the arc, by the
-real graph: the grayscale graph of world_space_non_uniform_blur_v<VERSION>.sbs
+real graph: world_space_non_uniform_blur_v<VERSION>.sbs, fed a grayscale mask,
 run through tools/sbsinterp.py on the test sphere. Grayscale, soft key light,
 transparent background.
 
@@ -133,7 +133,7 @@ def blur_area(pos):
 
 
 def effect_texture(opt):
-    """the mask blurred by the real filter (grayscale graph of the .sbs through tools/sbsinterp.py)."""
+    """the mask blurred by the real filter (the .sbs through tools/sbsinterp.py, grayscale in, as in a mask)."""
     pos, mask = make_sphere(TEX)
     P = pos[mask > 0.5]; mn, mx = P.min(0), P.max(0)
     position_map = (pos - mn) / (mx - mn).max()                                   # Painter-style [0,1]
@@ -143,10 +143,10 @@ def effect_texture(opt):
     bm = (blur_area(pos) if opt['blur'] == 'blob' else np.clip((pos @ r + 0.70) / 1.55, 0, 1)).astype(np.float32)
     prm = dict(COMMON, **opt['params'])
     t0 = time.time()
-    res = SI.run_graph(os.path.join(ROOT, OUTPUT_NAME), GRAPH_ID + '_grayscale',
+    res = SI.run_graph(os.path.join(ROOT, OUTPUT_NAME), GRAPH_ID,
                        {'input': m, 'mesh_position': pos4, 'mesh_uv_mask': mask, 'blur_map': bm}, params=prm)
     print('filter ran in %.0fs' % (time.time() - t0))
-    return res['output']
+    return res['output'][..., 0]
 
 
 def render(tex, res=128, ss=4, style=None):

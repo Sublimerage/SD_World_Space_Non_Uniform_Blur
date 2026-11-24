@@ -803,12 +803,6 @@ def param_bool(ident, label, desc, default, group=None, visible=None):
                '<visibleIf v="%s"/>' % esc(visible) if visible else ''))
 
 
-PARAM_IDS = ['samples', 'intensity', 'anisotropy', 'blades', 'angle', 'use_blur_map', 'blur_map_from_input',
-             'invert_blur_map', 'softness', 'quality', 'axis_x', 'axis_y', 'axis_z', 'dither']
-PARAM_TYPES = {'samples': T_INT, 'blades': T_INT, 'use_blur_map': BOOL, 'blur_map_from_input': BOOL,
-               'invert_blur_map': BOOL}
-
-
 def params_xml():
     BLUR = 'Blur'
     WS = 'World Space'
@@ -1014,58 +1008,16 @@ def build_colour(fast=True, lookup='quadratic'):
     return graph_xml(g, desc), len(g.nodes)
 
 
-def instance_param(name):
-    typ = PARAM_TYPES.get(name, F1)
-    if typ == T_INT:
-        ex = Ex('get_integer1', T_INT, data=('constantValueString', name))
-    elif typ == BOOL:
-        ex = get_bool(name)
-    else:
-        ex = param(name)
-    em = B.FunctionEmitter()
-    root = em.emit(ex, {})
-    return ('<parameter><name v="%s"/><relativeTo v="0"/><paramValue>%s</paramValue></parameter>'
-            % (name, em.xml(root)))
-
-
-def build_grayscale(pkg_uid):
-    """Grayscale wrapper: gray -> colour, instance of the colour graph, colour -> gray."""
-    g = B.Graph(GRAPH_ID + '_grayscale', 'World Space Non Uniform Blur Grayscale')
-    if os.path.exists(icon_path()):
-        g.set_icon(icon_path())
-    I = inputs(g, False)
-    g.paraminputs.append(params_xml())
-    col = g.pixel_processor('WSNB_ToColour', Program(lambda: sample_col(0, pos())), [I['input']], None,
-                            color=True, fmt=FMT_16, x=-400, y=0)
-    u, o = new_uid(), new_uid()
-    conns = [('input', col), ('blur_map', I['blur_map']), ('mesh_position', I['mesh_position']),
-             ('mesh_uv_mask', I['mesh_uv_mask'])]
-    g.nodes.append(
-        '<compNode><uid v="%d"/><connections>%s</connections><GUILayout><gpos v="-150 200 0"/></GUILayout>'
-        '<compOutputs><compOutput><uid v="%d"/><comptype v="1"/></compOutput></compOutputs><compImplementation>'
-        '<compInstance><path v="pkg:///%s?dependency=%d"/><parameters>%s</parameters><outputBridgings>'
-        '<outputBridging><uid v="%d"/><identifier v="output"/></outputBridging></outputBridgings></compInstance>'
-        '</compImplementation></compNode>'
-        % (u, ''.join('<connection><identifier v="%s"/><connRef v="%d"/><connRefOutput v="%d"/></connection>'
-                      % (name, n_, o_) for name, (n_, o_) in conns),
-           o, GRAPH_ID, pkg_uid, ''.join(instance_param(p_) for p_ in PARAM_IDS), o))
-    gray = g.pixel_processor('WSNB_ToGray', Program(lambda: sample_col(0, pos()).x), [(u, o)], None,
-                             color=False, fmt=FMT_16, x=100, y=0)
-    g.output('output', 'Output', gray, x=300, y=0)
-    return graph_xml(g, 'v%s - Grayscale version of World Space Non Uniform Blur (for masks).' % VERSION)
-
-
 def build_xml(fast=True, lookup='quadratic'):
     """The package XML. fast=False builds the plain graph the speed-ups are tested against
     (same output, more work)."""
     pkg_uid = new_uid()
     colour, n = build_colour(fast, lookup)
-    gray = build_grayscale(pkg_uid)
     xml = ('<?xml version="1.0" encoding="UTF-8"?><package><identifier v="%s"/><formatVersion v="1.1.0.202302"/>'
            '<updaterVersion v="1.1.0.202302"/><fileUID v="{4f6b2a1e-93c7-4d0a-b8e5-7c2d91a3f604}"/>'
            '<versionUID v="0"/><dependencies><dependency><filename v="?himself"/><uid v="%d"/><type v="package"/>'
-           '<fileUID v="0"/><versionUID v="0"/></dependency></dependencies><content>%s%s</content></package>'
-           % (GRAPH_ID, pkg_uid, colour, gray))
+           '<fileUID v="0"/><versionUID v="0"/></dependency></dependencies><content>%s</content></package>'
+           % (GRAPH_ID, pkg_uid, colour))
     return xml, n
 
 
