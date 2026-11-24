@@ -5,7 +5,7 @@ tools/sbsinterp.py) against its NumPy spec (tools/lite_ref.py), at reduced table
 Cases: box, sphere, a kit layout, stacked slabs, a door frame with stretched UV islands; Intensity small to large (view levels 1-4,
 with 64, 256 and 1024 px view tables),
 Samples, Blades, Anisotropy and Angle, Reference Axis, each blur map mode, Quality, Dither,
-and the grayscale graph. Each must match to 2e-3 (float32 graph vs float64 spec) and blur
+and a grayscale input (as in a mask). Each must match to 2e-3 (float32 graph vs float64 spec) and blur
 something.
 
     python3 tools/test_lite.py
@@ -73,10 +73,9 @@ def run(path, maps, prm, gray=False, cache={}):
     col, bmap = colour_input(pos, uvm)
     pos4 = np.concatenate([pos[..., :3], np.ones(pos.shape[:2] + (1,))], -1).astype(np.float32)
     params = dict(R.DEFAULTS, **prm)
-    gid = BWL.GRAPH_ID + ('_grayscale' if gray else '')
     imgs = {'input': col[..., 0] if gray else col, 'mesh_position': pos4, 'mesh_uv_mask': uvm.astype(np.float32),
-            'blur_map': bmap}
-    got = SI.run_graph(path, gid, imgs, params)['output']
+            'blur_map': bmap}                       # a grayscale input, as in a mask: read as grey
+    got = SI.run_graph(path, BWL.GRAPH_ID, imgs, params)['output']
     key = (id(maps), params['quality'], lref.VW)
     if key not in cache:
         cache[key] = R.prepare(pos, uvm, params['quality'])
@@ -84,9 +83,9 @@ def run(path, maps, prm, gray=False, cache={}):
     if gray:
         g4 = np.repeat(col[..., :1], 4, -1)
         g4[..., 3] = 1.0
-        want = R.nub_lite(g4, pos, uvm, bmap, params, cache[key], st)[..., 0]
-        got = got if got.ndim == 2 else got[..., 0]
-        src = col[..., 0]
+        want = R.nub_lite(g4, pos, uvm, bmap, params, cache[key], st)[..., :3]
+        got = got[..., :3]                          # all three channels: they must stay equal (grey)
+        src = g4[..., :3]
     else:
         want = R.nub_lite(col, pos, uvm, bmap, params, cache[key], st)
         got, want, src = got[..., :3], want[..., :3], col[..., :3]

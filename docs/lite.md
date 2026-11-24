@@ -2,12 +2,8 @@
 
 A cheaper companion to World Space Non-Uniform Blur: the same bokeh blur, in 3D so it's
 continuous across UV seams, but done on **6 axis views of each piece** instead of voxels.
-`world_space_non_uniform_blur_lite_v1.0.sbs` holds two graphs, like v2:
-
-| Graph | Use |
-|---|---|
-| `world_space_non_uniform_blur_lite` | colour input / output |
-| `world_space_non_uniform_blur_lite_grayscale` | grayscale input / output (masks) |
+`world_space_non_uniform_blur_lite_v1.0.sbs` holds one graph, `world_space_non_uniform_blur_lite`:
+use it on any channel, colour or grayscale, and in masks (a grayscale input is read as grey).
 
 Same inputs as v2 (Input, Blur Map, Mesh Position, Mesh UV Mask). The icon is v2's for now.
 
