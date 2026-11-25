@@ -10,10 +10,11 @@ the table passes don't depend on the texture size.
 
     python3 tools/bench_total.py run <file.sbs> <scene> <out dir> [setting ...]
     python3 tools/bench_total.py report <dir of variant A> <dir of variant B> ...
+    python3 tools/bench_total.py quality <dir of v2.1's runs> <dir> ...    (differences to v2.1)
     python3 tools/bench_total.py nodes <out dir> <scene> <setting>         (per-node table)
 
 Settings: default (Quality 4, Intensity 10, Samples 4, Softness 0.25), s1, s16 (Samples),
-soft0 (Softness 0), q3, q2 (Quality), nomap (Use Blur Map off), i0 (Intensity 0).
+soft0 (Softness 0), q3, q2 (Quality), nomap (Use Blur Map off), i0, i4, i30 (Intensity).
 """
 import json
 import os
@@ -42,6 +43,8 @@ SETTINGS = {
     'q2': dict(quality=2.0),
     'nomap': dict(use_blur_map=False),
     'i0': dict(intensity=0.0),
+    'i4': dict(intensity=4.0),
+    'i30': dict(intensity=30.0),
 }
 BYTES = {0: 1, 1: 2, 2: 2, 3: 4}      # per channel, by output format
 
@@ -168,6 +171,40 @@ def report(dirs):
                                        totals(j['nodes'], 4096)[1] / 2 ** 20))
 
 
+def quality(ref_dir, dirs):
+    """mean abs difference over the UV islands to the outputs in ref_dir (v2.1), and on the
+    plane to the 2D Non-Uniform Blur; on the plank, what reaches the unpainted bottom face"""
+    for sc in SCENES:
+        col, pos, uvm, bmap = scene(sc)
+        m = uvm > 0.5
+        for s in SETTINGS:
+            f = os.path.join(ref_dir, '%s_%s.npy' % (sc, s))
+            if not os.path.exists(f):
+                continue
+            a = np.load(f)[..., :3]
+            prm = dict(BV.PARAMS, **SETTINGS[s])
+            line = '%-7s %-8s v2.1 changes the input by %.4f' % (sc, s, np.abs(a - col[..., :3])[m].mean())
+            want = None
+            if sc == 'plane' and prm['use_blur_map'] and prm['intensity'] > 0:
+                want = BV.ref2d(col, prm['intensity'], int(prm['samples']), 5)
+                line += ' (%.4f from the 2D filter)' % np.abs(a - want)[40:-40, 40:-40].mean()
+            if sc == 'plank':
+                bot = m & (pos[..., 1] < pos[m][:, 1].min() + 1e-4)
+                line += ' (bottom face max %.4f)' % a[bot].max()
+            for d in dirs:
+                g = os.path.join(d, '%s_%s.npy' % (sc, s))
+                if not os.path.exists(g):
+                    continue
+                b = np.load(g)[..., :3]
+                line += ' | %s: %.4f from v2.1, max %.3f' % (os.path.basename(d.rstrip('/')), np.abs(a - b)[m].mean(),
+                                                           np.abs(a - b)[m].max())
+                if want is not None:
+                    line += ', %.4f from the 2D filter' % np.abs(b - want)[40:-40, 40:-40].mean()
+                if sc == 'plank':
+                    line += ', bottom face max %.4f' % b[bot].max()
+            print(line)
+
+
 def node_table(d, sc, s, target=2048):
     j = load(d, sc, s)
     k = (target / RES) ** 2
@@ -191,5 +228,7 @@ if __name__ == '__main__':
         run(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:] or ['default'])
     elif cmd == 'report':
         report(sys.argv[2:])
+    elif cmd == 'quality':
+        quality(sys.argv[2], sys.argv[3:])
     else:
         node_table(*sys.argv[2:5])

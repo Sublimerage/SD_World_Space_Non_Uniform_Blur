@@ -161,13 +161,16 @@ B.FunctionEmitter = DedupEmitter      # used by B.Graph.pixel_processor
 VERSION = '2.1'
 GRAPH_ID = 'world_space_non_uniform_blur'
 OUTPUT_NAME = '%s_v%s.sbs' % (GRAPH_ID, VERSION)
-# Lite: the same graph with tables of half the size per axis and no Softness (no mip pyramids)
+# Lite: the same graph with voxel, sort and box tables of half the size per axis and no Softness (no mip
+# pyramids)
 LITE_VERSION = '1.0'
 LITE_GRAPH_ID = 'world_space_non_uniform_blur_lite'
 LITE_OUTPUT_NAME = '%s_v%s.sbs' % (LITE_GRAPH_ID, LITE_VERSION)
 # ref.configure() arguments of Lite: PMAX, AW, AH, CW, CH, DMAX, S_MAX, R_MAX, Quality -> voxel budget n^3,
 # frame grid, reads per patch axis, area grid
-LITE_CONFIG = (256, 512, 512, 512, 512, 128, 16, 16, {1: 32, 2: 40, 3: 48, 4: 64}, 64, 4, 32)
+# The surface samples stay at v2.1's 512 x 512: with 256 x 256, a stretched UV island (the thin plank's
+# top face, 4 - 5 voxels between samples) left stripes of unblurred texels.
+LITE_CONFIG = (512, 512, 512, 512, 512, 128, 16, 16, {1: 32, 2: 40, 3: 48, 4: 64}, 64, 4, 32)
 TAGS = 'filter;blur;non uniform;bokeh;world space'
 MAX_PASSES = 16
 LEVELS = 5                               # voxel mip levels 0..4 per box (0 = the voxel grid itself)
