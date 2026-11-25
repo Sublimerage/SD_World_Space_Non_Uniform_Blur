@@ -10,6 +10,8 @@ full-size graph at 512^2, then each texel of the square-island door is compared 
 nearest texel of the proportional one (same 3D point).
 
     python3 tools/test_stretched.py [v2.0.sbs]     (v2.0's file: also reports v2.0's numbers)
+
+Lite is checked the same way (it keeps v2.1's 512 x 512 surface samples).
 """
 import os
 import sys
@@ -26,6 +28,7 @@ import layout_mesh  # noqa: E402
 import sbsinterp as SI  # noqa: E402
 import build_wsnub as W  # noqa: E402
 import bench_v2 as BV  # noqa: E402
+import bench_total as BT  # noqa: E402
 
 RES = 512
 PARAMS = dict(intensity=10.0, samples=4, quality=4.0, dither=0.0, use_blur_map=False)
@@ -45,7 +48,7 @@ def run(path, pos, uvm):
     nm = {v: k for k, v in BV.names(path).items()}
     pos4 = np.concatenate([pos, np.ones(pos.shape[:2] + (1,))], -1).astype(np.float32)
     col = colour(pos, uvm)
-    r = SI.run_graph(path, W.GRAPH_ID, {'input': col, 'mesh_position': pos4, 'mesh_uv_mask': uvm.astype(np.float32),
+    r = SI.run_graph(path, BT.graph_info(path)[0], {'input': col, 'mesh_position': pos4, 'mesh_uv_mask': uvm.astype(np.float32),
                                         'blur_map': np.ones(uvm.shape, np.float32)}, dict(PARAMS),
                      keep=[nm['WSB_PackArea'], nm['WSB_PackPos']])
     pa, pp = r['_nodes'][nm['WSB_PackArea']], r['_nodes'][nm['WSB_PackPos']]
@@ -83,6 +86,10 @@ def main():
         check('v2.0', sys.argv[1])
     zero, post, unbl, lintel = check('v%s' % W.VERSION, path)
     ok = zero == 0.0 and unbl < 0.001 and post < 2.0 * lintel + 0.005
+    lite = os.path.join(os.path.dirname(path), 'lite.sbs')
+    W.build(lite, lite=True)
+    zero, post, unbl, lintel = check('Lite', lite)
+    ok = ok and zero == 0.0 and unbl < 0.001 and post < 2.0 * lintel + 0.005
     print('ALL PASS' if ok else 'FAILED')
     return ok
 

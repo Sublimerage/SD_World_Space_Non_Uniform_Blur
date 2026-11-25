@@ -10,6 +10,7 @@ the table passes don't depend on the texture size.
 
     python3 tools/bench_total.py run <file.sbs> <scene> <out dir> [setting ...]
     python3 tools/bench_total.py report <dir of variant A> <dir of variant B> ...
+    python3 tools/bench_total.py table <before dir> <v2.1 dir> <Lite dir>  (the README's table)
     python3 tools/bench_total.py quality <dir of v2.1's runs> <dir> ...    (differences to v2.1)
     python3 tools/bench_total.py nodes <out dir> <scene> <setting>         (per-node table)
 
@@ -171,6 +172,35 @@ def report(dirs):
                                        totals(j['nodes'], 4096)[1] / 2 ** 20))
 
 
+def table(before, after, lite):
+    """the README table: v2.1 before the skipping, v2.1, Lite; default / Samples 1 / 16 / Softness 0"""
+    label = {'default': 'defaults', 's1': 'Samples 1', 's16': 'Samples 16', 'soft0': 'Softness 0'}
+    title = {'sphere': 'Sphere', 'layout': 'Kit layout, 4 pieces', 'plane': 'Flat plane', 'plank': 'Thin plank'}
+
+    def cell(d, sc, s, target, base=None):
+        j = load(d, sc, s)
+        if j is None:
+            return '–', None
+        c, _ = totals(j['nodes'], target)
+        tr, tn = c['mesh'][0] + c['stroke'][0], c['mesh'][1] + c['stroke'][1]
+        txt = '%.2f + %.2f = **%.2f** / %.0f' % (c['mesh'][0] / 1e9, c['stroke'][0] / 1e9, tr / 1e9, tn / 1e9)
+        if base:
+            txt += ' (%.1f× / %.1f×)' % (base[0] / tr, base[1] / tn)
+        return txt, (tr, tn)
+
+    for target in (2048, 4096):
+        print('\n**%d²**\n' % target)
+        print('| Scene | Settings | v2.1 before | v2.1 (× less) | Lite 1.0 (× less than v2.1 before) |')
+        print('|---|---|---|---|---|')
+        for sc in SCENES:
+            for s in label:
+                b, base = cell(before, sc, s, target)
+                a, _ = cell(after, sc, s, target, base)
+                # Lite has no Softness: its Softness 0 row is its default run
+                li, _ = cell(lite, sc, 'default' if s == 'soft0' else s, target, base)
+                print('| %s | %s | %s | %s | %s |' % (title[sc] if s == 'default' else '', label[s], b, a, li))
+
+
 def quality(ref_dir, dirs):
     """mean abs difference over the UV islands to the outputs in ref_dir (v2.1), and on the
     plane to the 2D Non-Uniform Blur; on the plank, what reaches the unpainted bottom face"""
@@ -228,6 +258,8 @@ if __name__ == '__main__':
         run(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:] or ['default'])
     elif cmd == 'report':
         report(sys.argv[2:])
+    elif cmd == 'table':
+        table(*sys.argv[2:5])
     elif cmd == 'quality':
         quality(sys.argv[2], sys.argv[3:])
     else:
