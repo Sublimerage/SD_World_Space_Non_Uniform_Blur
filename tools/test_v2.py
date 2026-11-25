@@ -1,4 +1,4 @@
-"""Tests for world_space_non_uniform_blur (v2.0): runs the generated .sbs through
+"""Tests for world_space_non_uniform_blur (v2.1) and its Lite: runs the generated .sbs through
 tools/sbsinterp.py at reduced table sizes (like World Space Mask Blur's
 test_sbs.py) on the demo box, kit layouts of pieces placed far apart (4 pieces;
 6 in a row, more slabs than the small tables hold; a column along Z; a stack
@@ -10,7 +10,11 @@ Checks:
     leaves every other piece's result unchanged;
   * the mesh's size and units don't matter (1/1000 scale gives the same result);
   * the per-box mip pyramid equals a direct [1 3 3 1] / 8 downsample of each box's
-    voxels, and every mip entry maps back to the right box.
+    voxels, and every mip entry maps back to the right box; in the shipping graph the
+    levels no tap reads stay empty;
+  * work that isn't used isn't done: inactive pass slots read their input and nothing
+    else, their mips read nothing, texels that keep the input read 3 texels;
+  * Lite: blurred, pieces don't interact, size and units don't matter.
 
     python3 tools/test_v2.py
 """
@@ -38,11 +42,20 @@ COLUMN = [((0.6, 0.3, 1.0), (0.0, 0.0, 0.4 * i)) for i in range(3)]
 STACK = [((1.0, 0.2, 1.0), (0.0, 0.6 * i, 0.0)) for i in range(4)]
 
 
-def build(config):
+def build(config, **kw):
     ref.configure(*config)
     path = os.path.join(tempfile.mkdtemp(), 'wsnub.sbs')
-    W.build(path)
+    W.build(path, **({'config': config} if kw.get('lite') else {}), **kw)
     return path
+
+
+def node_names(path):
+    """{node name: [uids]} of the package's graph"""
+    import xml.etree.ElementTree as ET
+    names = {}
+    for o in ET.parse(path).getroot().find('content/graph').iter('GUIObject'):
+        names.setdefault(o.find('GUIName').get('v'), []).append(o.find('GUIDependency').get('v').split('?')[1])
+    return names
 
 
 def colour_input(pos, uvm, mask=None):
@@ -62,11 +75,13 @@ def colour_input(pos, uvm, mask=None):
 
 
 def run(path, col, pos, uvm, bmap, params, keep=None):
+    import xml.etree.ElementTree as ET
     pos4 = np.concatenate([pos, np.ones(pos.shape[:2] + (1,))], -1).astype(np.float32)
     prm = dict(dither=0.0, blur_map_from_input=False)
     prm.update(params)
-    r = SI.run_graph(path, W.GRAPH_ID, {'input': col, 'mesh_position': pos4, 'mesh_uv_mask': uvm.astype(np.float32),
-                                        'blur_map': bmap}, prm, keep=keep)
+    gid = ET.parse(path).getroot().find('content/graph/identifier').get('v')      # v2.1 or Lite
+    r = SI.run_graph(path, gid, {'input': col, 'mesh_position': pos4, 'mesh_uv_mask': uvm.astype(np.float32),
+                                 'blur_map': bmap}, prm, keep=keep)
     return r['output'], r
 
 
@@ -119,22 +134,26 @@ def check_scale(name, path, maps, params):
     return report(name, d.max() < 2e-3, 'max diff %.1e, mean %.1e' % (d.max(), d.mean()))
 
 
-def check_mips(name, path, maps, params):
-    """WSNB_Mip1..4 of pass 1 against a direct per-box downsample of the voxels"""
-    import xml.etree.ElementTree as ET
+def levels_read(radius_voxels, softness):
+    """how many mip levels pass 1's taps read at this largest radius (W.tap_level, W.pass_pyramid)"""
+    x = float(np.clip(np.float32(softness) * np.float32(0.4) * np.float32(radius_voxels) / np.float32(0.64), 1.0, 16.0))
+    lev = np.floor(np.log2(x)) + (x / 2.0 ** np.floor(np.log2(x)) - 1.0)
+    return int(sum(lev > l - 1 for l in range(1, W.LEVELS))) if softness > 0 else 0
+
+
+def check_mips(name, path, maps, params, skipping=True):
+    """WSNB_Mip1..4 of pass 1 against a direct per-box downsample of the voxels. The shipping
+    graph (skipping) only makes the levels pass 1's taps read; the others must be empty."""
     mask, pos, uvm = maps
     col, bmap = colour_input(pos, uvm, mask)
-    root = ET.parse(path).getroot()
-    graph = [g for g in root.iter('graph') if g.find('identifier').get('v') == W.GRAPH_ID][0]
-    names = {}
-    for o in graph.iter('GUIObject'):
-        names.setdefault(o.find('GUIName').get('v'), []).append(o.find('GUIDependency').get('v').split('?')[1])
+    names = node_names(path)
     keep = [names['WSNB_Voxels'][0], names['WSB_VoxBoxes'][0], names['WSNB_MipBoxes'][0], names['WSNB_MipMap'][0]] + \
-        [names['WSNB_Mip%d' % l][0] for l in range(1, W.LEVELS)]
+        [names['WSNB_Mip%d' % l][0] for l in range(1, W.LEVELS)] + [names['WSNB_Radius'][0]]
     _, r = run(path, col, pos, uvm, bmap, params, keep=keep)
     nodes = r['_nodes']
     vox, vb, mb, mm = (nodes[k] for k in keep[:4])
-    mips = [nodes[k] for k in keep[4:]]
+    mips = [nodes[k] for k in keep[4:-1]]
+    made = levels_read(nodes[keep[-1]][8, 4, 0], params.get('softness', 0.25)) if skipping else W.LEVELS - 1
     bases, QW, QH = W.mip_layout()
     R, S = ref.R_MAX, ref.S_MAX
     k = np.array([1, 3, 3, 1]) / 8.0
@@ -162,12 +181,57 @@ def check_mips(name, path, maps, params):
             grid, n = pad, d
             ol = int(offs[l - 1])
             got = q[ol:ol + n.prod()].reshape(n[2], n[1], n[0], 4)
+            if l > made:
+                if np.abs(got).max() != 0.0:
+                    return report(name, False, 'level %d is not read by any tap but was computed' % l)
+                continue
             worst = max(worst, np.abs(got - grid).max() / max(np.abs(grid).max(), 1e-12))
             ids = qm[ol:ol + n.prod()]
             if not (ids[:, 0] == b).all():
                 return report(name, False, 'mip map: entries of box %d level %d point elsewhere' % (b, l))
     # every pass-1 mip read the voxels of pass 1: worst is the half-float rounding
-    return report(name, worst < 5e-3, '%d boxes, worst relative diff %.1e' % (nbox, worst))
+    return report(name, worst < 5e-3, '%d boxes, %d of %d levels made, worst relative diff %.1e'
+                  % (nbox, made, W.LEVELS - 1, worst))
+
+
+def check_skipped(name, path, maps):
+    """Work that isn't used isn't done (counted by the interpreter as executed)."""
+    mask, pos, uvm = maps
+    col, bmap = colour_input(pos, uvm, mask)
+    names = node_names(path)
+    nvox = ref.AW * ref.AH
+    ntex = uvm.size
+
+    def reads(node, k=None):
+        u = names[node]
+        return [SI.STATS[x]['reads'] for x in u] if k is None else SI.STATS[u[k]]['reads']
+
+    bad = []
+    P = dict(intensity=24.0, samples=4.0, quality=3.0)
+    # 4 of 16 pass slots run: the other 12 read their input (1 read per voxel), their mips nothing
+    SI.STATS.clear()
+    run(path, col, pos, uvm, bmap, P)
+    off = [reads('WSNB_Pass%d' % k, 0) for k in range(5, W.MAX_PASSES + 1)]
+    on = [reads('WSNB_Pass%d' % k, 0) for k in range(1, 5)]
+    if any(x != nvox for x in off) or min(on) <= nvox:
+        bad.append('pass slots: on %s, off %s reads (%d voxels)' % (on, off, nvox))
+    mips_off = sum(sum(reads('WSNB_Mip%d' % l)[4:]) for l in range(1, W.LEVELS))
+    if mips_off != 0 or sum(reads('WSNB_Mip1')[:4]) == 0:
+        bad.append('mips of inactive slots read %d' % mips_off)
+    # Softness 0: no mip is read
+    SI.STATS.clear()
+    run(path, col, pos, uvm, bmap, dict(P, softness=0.0))
+    mips = sum(sum(reads('WSNB_Mip%d' % l)) for l in range(1, W.LEVELS))
+    if mips != 0:
+        bad.append('Softness 0: mips read %d' % mips)
+    # Intensity 0: every pass slot is off, and a texel reads the input, the UV mask and the radius
+    SI.STATS.clear()
+    out, _ = run(path, col, pos, uvm, bmap, dict(P, intensity=0.0, use_blur_map=False))
+    passes = [reads('WSNB_Pass%d' % k, 0) for k in range(1, W.MAX_PASSES + 1)]
+    if any(x != nvox for x in passes) or reads('WSNB_Resolve', 0) != 3 * ntex or np.abs(out - col).max() > 1e-4:
+        bad.append('Intensity 0: passes %s, resolve %d reads for %d texels' % (passes, reads('WSNB_Resolve', 0), ntex))
+    return report(name, not bad, '; '.join(bad) or '12 idle pass slots: 1 read per voxel, their mips 0; Softness 0: '
+                  'mips 0; Intensity 0: 3 reads per texel')
 
 
 def main():
@@ -195,6 +259,23 @@ def main():
     ok.append(check_independent('layout 96px, column along Z, independent', path,
                                 layout_mesh.make_layout(96, 12.0, COLUMN), COLUMN, P))
     ok.append(check_independent('layout 96px, stack along Y, independent', path,
+                                layout_mesh.make_layout(96, 12.0, STACK), STACK, P))
+    # the shipping graph only makes the mip levels that are read; the plain one makes them all
+    big = dict(P, softness=1.0, intensity=50.0)
+    ok.append(check_mips('box 64px, mips at Softness 1, Intensity 50', path, box, big))
+    plain = build(SMALL, fast=False)
+    ok.append(check_mips('box 64px, mip pyramid, plain graph', plain, box, P, skipping=False))
+    ok.append(check_mips('layout 96px, mip pyramid, plain graph', plain, lay, P, skipping=False))
+    ok.append(check_skipped('box 64px, unused work is skipped', path, box))
+    # Lite, at the same reduced sizes
+    lite = build(SMALL, lite=True)
+    ok.append(check_blur('Lite: box 64px', lite, box, P)[0])
+    ok.append(check_blur('Lite: box 64px, quality 1, anisotropy, 8 samples', lite, box,
+                         dict(P, quality=1.0, anisotropy=0.7, samples=8.0))[0])
+    ok.append(check_scale('Lite: box 64px, scaled to 1/1000', lite, box, P))
+    ok.append(check_blur('Lite: layout 96px, 4 pieces', lite, lay, P)[0])
+    ok.append(check_independent('Lite: layout 96px, 4 pieces don\'t interact', lite, lay, layout_mesh.PIECES, P))
+    ok.append(check_independent('Lite: layout 96px, stack along Y, independent', lite,
                                 layout_mesh.make_layout(96, 12.0, STACK), STACK, P))
     print('ALL PASS' if all(ok) else 'SOME FAILED')
     return all(ok)

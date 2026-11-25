@@ -130,12 +130,38 @@ class Block:
         self.stmts, self.result = list(stmts), result
 
 
+def skippable(prog, go):
+    """A vendored Program as a Block that only runs where go() > 0.5 (callable -> float Ex);
+    elsewhere the result is 0 and nothing is read."""
+    res = Var('res', F4)
+    if prog.cond is None:
+        inner = [(res, prog.result)]
+    else:
+        inner = [Loop(prog.init, prog.cond, prog.body, prog.counter, prog.max_iter), (res, prog.result)]
+    return Block([(res, lambda: const(0.0, 4)), When(go, inner)], lambda: res.get())
+
+
+def frame_texel():
+    """1 at the two texels of a 16 x 16 global table that are ever read (B.frame_a, B.frame_b),
+    0 at the other 254. tools/check_types.py checks that nothing reads those."""
+    px = floor(pos() * 16.0)
+    ax, bx = B.FRAME_A_UV[0] * 16.0 - 0.5, B.FRAME_B_UV[0] * 16.0 - 0.5
+    row = B.FRAME_A_UV[1] * 16.0 - 0.5
+    return flag(land(lt(fabs(px.y - row), 0.5), lor(lt(fabs(px.x - ax), 0.5), lt(fabs(px.x - bx), 0.5))))
+
+
+def global_table(prog, skip):
+    """A 16 x 16 global table (Bounds, Coarse, the fits, AreaTotal): every texel used to run
+    the whole loop; with `skip` only the two texels that are read do."""
+    return skippable(prog, frame_texel) if skip else prog
+
+
 B.FunctionEmitter = DedupEmitter      # used by B.Graph.pixel_processor
 
 VERSION = '2.1'
 GRAPH_ID = 'world_space_non_uniform_blur'
 OUTPUT_NAME = '%s_v%s.sbs' % (GRAPH_ID, VERSION)
-# Lite: the same graph with smaller tables, no Softness (no mip pyramids) and a trilinear final lookup
+# Lite: the same graph with tables of half the size per axis and no Softness (no mip pyramids)
 LITE_VERSION = '1.0'
 LITE_GRAPH_ID = 'world_space_non_uniform_blur_lite'
 LITE_OUTPUT_NAME = '%s_v%s.sbs' % (LITE_GRAPH_ID, LITE_VERSION)
@@ -144,6 +170,7 @@ LITE_OUTPUT_NAME = '%s_v%s.sbs' % (LITE_GRAPH_ID, LITE_VERSION)
 LITE_CONFIG = (256, 512, 512, 512, 512, 128, 16, 16, {1: 32, 2: 40, 3: 48, 4: 64}, 64, 4, 32)
 TAGS = 'filter;blur;non uniform;bokeh;world space'
 MAX_PASSES = 16
+NEAR = True
 LEVELS = 5                               # voxel mip levels 0..4 per box (0 = the voxel grid itself)
 C_DECAY = math.sqrt(-math.log(0.001))    # same pass decay as the 2D Non-Uniform Blur
 T_INT = 16
@@ -415,6 +442,49 @@ def pass_pack_area_skip():
                  lambda: vec(a.get() / n, cnt.get() / n, tol2(), 1.0))
 
 
+def _search_step(s, target):
+    """one step of B.pass_cells' binary search for the first sorted key >= target (slot 0)"""
+    lo, hi = s.get().x, s.get().y
+    mid = floor((lo + hi) * 0.5)
+    key = sample_col(0, index_uv(mid)).x
+    nxt = select(lt(key, target), vec(mid + 1.0, hi), vec(lo, mid))
+    return select(lt(lo, hi), nxt, s.get())
+
+
+def pass_cell_starts(W, H):
+    """WSB_Starts0 / WSB_Starts1 (linear W x H, mesh only) -> (start, 0, 0, 1): where each cell's
+    samples start in the sorted list: B.pass_cells' first binary search. Slot 0: sorted keys."""
+    L = float(ref.PMAX ** 2)
+    s1, cid, i = Var('s1', F2), Var('cid', F1), Var('i', F1)
+    return Program(lambda: vec(s1.get().x, 0.0, 0.0, 1.0),
+                   init=[(cid, lambda: my_index(W, H)), (s1, lambda: vec(0.0, L)), (i, lambda: const(0.0))],
+                   cond=lambda: ge(s1.get().x, s1.get().y),
+                   body=[(s1, lambda: _search_step(s1, cid.get())), (i, lambda: i.get() + 1.0)],
+                   counter=i, max_iter=int(L).bit_length() + 9)
+
+
+def pass_cells_joined(W, H):
+    """WSB_Cells0 / WSB_Cells1 with half the searches (same result as B.pass_cells, which does
+    two binary searches per cell): a cell's end is the first key >= its id + 1, which is the
+    next cell's start. Only the last cell searches for its end. Slots: 0 sorted keys, 1 Starts."""
+    L = float(ref.PMAX ** 2)
+    last = float(W * H - 1)
+    s2, cid, i, e = Var('s2', F2), Var('cid', F1), Var('i', F1), Var('e', F1)
+
+    def is_last():
+        return ge(cid.get(), last - 0.5)
+
+    return Block([(cid, lambda: my_index(W, H)),
+                  (e, lambda: sample_col(1, lin_uv(fmin(cid.get() + 1.0, last), W, H)).x),
+                  When(lambda: flag(is_last()),
+                       [Loop([(s2, lambda: vec(0.0, L)), (i, lambda: const(0.0))],
+                             lambda: ge(s2.get().x, s2.get().y),
+                             [(s2, lambda: _search_step(s2, cid.get() + 1.0)), (i, lambda: i.get() + 1.0)],
+                             i, int(L).bit_length() + 9),
+                        (e, lambda: select(is_last(), s2.get().x, e.get()))])],
+                 lambda: vec(sample_col(1, pos()).x, e.get(), 0.0, 1.0))
+
+
 # ----------------------------------------------------------------------------
 # splats (AW x AH voxel tables): each voxel gathers the samples of its box next to
 # it through the sorted list, like WSB_Splat.
@@ -535,7 +605,7 @@ def splat_program(accs, result, active=None, extra=lambda v: v, fast=False, near
                    body=body, counter=t, max_iter=65536)
 
 
-def pass_normals(fast=False, skip=False):
+def pass_normals(fast=False, skip=False, near=True):
     """WSNB_Normals (AW x AH, mesh + Quality) -> (unit surface normal, sum w) per voxel, 0 if empty.
     The normal is the dominant eigenvector of the area-weighted normal tensor (sign-free, so
     mirrored UV islands don't cancel out), oriented like the summed signed normals."""
@@ -554,7 +624,7 @@ def pass_normals(fast=False, skip=False):
 
     accs = [(wsum, lambda n, w: w), (nsum, lambda n, w: n.xyz * w), (tdia, lambda n, w: n.xyz * n.xyz * w),
             (toff, lambda n, w: vec(n.x * n.y, n.x * n.z, n.y * n.z) * w)]
-    return splat_program(accs, result, extra=lambda v: unit3(v.xyz), fast=fast, near=True, skip=skip)
+    return splat_program(accs, result, extra=lambda v: unit3(v.xyz), fast=fast, near=near, skip=skip)
 
 
 def pass_splat_colour(fast=False, skip=False):
@@ -785,20 +855,20 @@ def pass_pyramid_skip(l, k):
         uv = atlas_uv(idx) if l == 1 else lin_uv(idx, QW, QH)
         return acc.get() + select(inside3(src, d), sample_col(0, uv) * wv, const(0.0, 4))
 
-    stmts = [(act, lambda: const(0.0)), (acc, lambda: const(0.0, 4)), (low, lambda: const(0.0, 4)),
-             (nn, lambda: const(0.0, 2)),
-             When(lambda: flag(uses_mips()), [(nn, nn_init)])]
+    res = Var('res', F4)
+    inner = [(nn, nn_init), (act, lambda: const(0.0)), (acc, lambda: const(0.0, 4)), (low, lambda: const(0.0, 4))]
     if l > 1:
-        # the lower levels, from the previous table
-        stmts.append(When(lambda: flag(lower()), [(low, lambda: select(lower(), sample_col(0, pos()),
-                                                                       const(0.0, 4)))]))
-    stmts.append(When(lambda: flag(land(on(nn.get().x), inreg())),
-                      [(mm, lambda: sample_col(1, pos())), (ijk, lambda: mm.get()[1, 2, 3]), (dp, parent_dims),
-                       (po, parent_off),
-                       (act, lambda: flag(land(land(on(nn.get().x), inreg()), gt(mm.get().x, -0.5)))),
-                       Loop([(i, lambda: const(0.0))], lambda: lor(ge(i.get(), 64.0), lt(act.get(), 0.5)),
-                            [(acc, upd), (i, lambda: i.get() + 1.0)], i, 72)]))
-    return Block(stmts, lambda: select(on(act.get()), acc.get(), low.get()))
+        # the lower levels, from the previous table (only when the pass reads mips at all)
+        inner.append(When(lambda: nn.get().y, [(low, lambda: select(lower(), sample_col(0, pos()), const(0.0, 4)))]))
+    inner += [When(lambda: nn.get().x,
+                   [(mm, lambda: sample_col(1, pos())),
+                    (act, lambda: flag(land(land(on(nn.get().x), inreg()), gt(mm.get().x, -0.5))))]),
+              When(lambda: act.get(), [(ijk, lambda: mm.get()[1, 2, 3]), (dp, parent_dims), (po, parent_off)]),
+              Loop([(i, lambda: const(0.0))], lambda: lor(ge(i.get(), 64.0), lt(act.get(), 0.5)),
+                   [(acc, upd), (i, lambda: i.get() + 1.0)], i, 72),
+              (res, lambda: select(on(act.get()), acc.get(), low.get()))]
+    # an idle slot (or Softness 0) tests one condition and writes 0
+    return Block([(res, lambda: const(0.0, 4)), When(lambda: flag(uses_mips()), inner)], lambda: res.get())
 
 
 # ----------------------------------------------------------------------------
@@ -937,13 +1007,11 @@ def pass_blur(k, skip=False, mips=True):
                            * pow2(l0.get() + 1.0))]),
                     (acc, lambda: acc.get() + (select(lt(l0.get(), 0.5), a0.get(), aq.get()) * (1.0 - ff.get())
                                                + bq.get() * ff.get()))]
-            zero = [(l0, lambda: const(0.0)), (ff, lambda: const(0.0)), (a0, lambda: const(0.0, 4)),
-                    (aq, lambda: const(0.0, 4)), (bq, lambda: const(0.0, 4))]
+            frame += [(a0, lambda: const(0.0, 4)), (aq, lambda: const(0.0, 4)), (bq, lambda: const(0.0, 4))]
         else:
             taps = [(acc, lambda: acc.get() + tap_voxels(tap_pos(), n0.get(), o0.get()))]
-            zero = []
         return Block(
-            [(vv, lambda: sample_col(0, pos())), (act, lambda: const(0.0)), (acc, lambda: const(0.0, 4))] + zero +
+            [(vv, lambda: sample_col(0, pos())), (act, lambda: const(0.0)), (acc, lambda: const(0.0, 4))] +
             [When(lambda: flag(land(pass_on(k), gt(vv.get().w, 0.0))),
                   [(vm, lambda: sample_col(5, pos())), (r, r_init), (act, act_init)]),
              When(lambda: act.get(), frame),
@@ -1044,18 +1112,16 @@ def pass_resolve(fast=False):
                    body=[(S, upd9 if fast else upd), (i, lambda: i.get() + 1.0)], counter=i, max_iter=int(steps) + 8)
 
 
-def pass_resolve_skip(lookup='quadratic'):
+def pass_resolve_skip():
     """pass_resolve(fast=True) doing only the work that is used (same result):
       * a texel that keeps the input (outside the UV islands, a black blur map, Intensity 0)
         reads the input, the UV mask and the radius, and nothing else: its box isn't looked up;
       * the box is looked up once (the plain graph does it twice);
       * the Blur Map input is only read when it is used;
-      * the dither noise is only made where the result is blurred and Dither isn't 0.
-    lookup='linear' (Lite): a trilinear lookup, 8 reads instead of 27."""
+      * the dither noise is only made where the result is blurred and Dither isn't 0."""
     p, bf, ta, n, src = Var('p', F3), Var('bf', F2), Var('ta', F4), Var('n', F3), Var('src', F4)
     i0, tf, al, S, i = Var('i0', F3), Var('tf', F3), Var('al', F1), Var('S', F4), Var('i', F1)
     al0, ml, gq, res, o3, dz = Var('al0', F1), Var('ml', F1), Var('gq', F3), Var('res', F4), Var('o3', F3), Var('dz', F3)
-    linear = lookup == 'linear'
 
     def quad(t):
         a, b = 0.5 - t, 0.5 + t
@@ -1087,18 +1153,6 @@ def pass_resolve_skip(lookup='quadratic'):
                 acc = acc + read(float(a), float(b), c, wx[a], wy[b], wz)
         return acc
 
-    def upd8():
-        t = tf.get()
-        acc = None
-        for c in range(2):
-            for b in range(2):
-                for a in range(2):
-                    w = (t.x if a else 1.0 - t.x) * (t.y if b else 1.0 - t.y) * (t.z if c else 1.0 - t.z)
-                    cell = i0.get() + const([float(a), float(b), float(c)])
-                    v = sample_col(3, atlas_uv(ta.get().w + lin3(cell, n.get()))) * w
-                    acc = v if acc is None else acc + v
-        return acc
-
     def blurred():
         return land(gt(al.get(), 0.0), gt(S.get().w, 1e-6))      # S.w is relative to the mean sample area
 
@@ -1120,23 +1174,15 @@ def pass_resolve_skip(lookup='quadratic'):
     lookup_setup = [(p, lambda: sample_col(1, pos()).xyz), (bf, bf_init),
                     (ta, lambda: sample_col(8, box_uv(bf.get().x, 0.0))),
                     (n, lambda: box_dims(8, bf.get().x).xyz), (gq, gq_init)]
-    if linear:
-        lookup_setup += [(i0, lambda: floor(gq.get())), (tf, lambda: gq.get() - floor(gq.get()))]
-    else:
-        lookup_setup += [(i0, lambda: floor(gq.get() + 0.5)), (tf, lambda: gq.get() - floor(gq.get() + 0.5))]
-    lookup_setup.append((al, lambda: select(on(bf.get().y), al0.get(), 0.0)))
-    if linear:
-        reads = When(lambda: flag(gt(al.get(), 0.0)), [(S, lambda: select(gt(al.get(), 0.0), upd8(), const(0.0, 4)))])
-    else:
-        reads = Loop([(i, lambda: const(0.0))], lambda: lor(ge(i.get(), 3.0), le(al.get(), 0.0)),
-                     [(S, upd9), (i, lambda: i.get() + 1.0)], i, 11)
+    lookup_setup += [(i0, lambda: floor(gq.get() + 0.5)), (tf, lambda: gq.get() - floor(gq.get() + 0.5)),
+                     (al, lambda: select(on(bf.get().y), al0.get(), 0.0))]
+    reads = Loop([(i, lambda: const(0.0))], lambda: lor(ge(i.get(), 3.0), le(al.get(), 0.0)),
+                 [(S, upd9), (i, lambda: i.get() + 1.0)], i, 11)
     stmts = [(src, lambda: sample_col(0, pos())), (res, lambda: src.get()), (al, lambda: const(0.0)),
              (S, lambda: const(0.0, 4)), (ml, lambda: const(0.0)),
              When(map_used, [(ml, lambda: sample_lum(9, pos()))]),
              (al0, al0_init),
-             When(lambda: flag(gt(al0.get(), 0.0)), lookup_setup + ([] if linear else [reads]))]
-    if linear:
-        stmts.append(reads)
+             When(lambda: flag(gt(al0.get(), 0.0)), lookup_setup + [reads])]
     stmts.append(When(lambda: flag(blurred()),
                       [(o3, o3_init), (dz, lambda: const(0.0, 3)),
                        When(lambda: flag(gt(fabs(param('dither')), 0.0)), [(dz, noise)]),
@@ -1370,18 +1416,24 @@ def build_colour(fast=True, lookup='quadratic', skip=None, lite=False):
     # --- mesh only: World Space Mask Blur v2.1, as is (PackArea: the same result with less work) ---
     size = g.pixel_processor('WSB_Size', B.pass_size(), [position], None, x=-1400, y=600,
                              rel_log2=(B.SIZE_LOG2, B.SIZE_LOG2))
-    bounds = pp('WSB_Bounds', B.pass_bounds(), [position, uvmask, size], one, -1250, 500)
-    coarse = pp('WSB_Coarse', B.pass_coarse(), [bounds], one, -1150, 500)
+    bounds = pp('WSB_Bounds', global_table(B.pass_bounds(), skip), [position, uvmask, size], one, -1250, 500)
+    coarse = pp('WSB_Coarse', global_table(B.pass_coarse(), skip), [bounds], one, -1150, 500)
     pack_pos = pp('WSB_PackPos', B.pass_pack_pos(), [position, uvmask, size], lp, -1250, 300)
     pack_area = pp('WSB_PackArea', pass_pack_area_skip() if skip else B.pass_pack_area(),
                    [position, uvmask, pack_pos, coarse, size], lp, -1100, 400)
     area_blocks = pp('WSB_AreaBlocks', B.pass_area_blocks(), [pack_area], (log2(ref.AREA_GRID),) * 2, -1000, 450)
-    area_total = pp('WSB_AreaTotal', B.pass_area_total(), [area_blocks], one, -900, 450)
+    area_total = pp('WSB_AreaTotal', global_table(B.pass_area_total(), skip), [area_blocks], one, -900, 450)
     keys = pp('WSB_Keys0', B.pass_keys0(), [pack_pos, coarse], lp, -1100, 850)
     for n, (k, j) in enumerate(ref.sort_steps()):
         keys = pp('WSB_Sort0 %d/%d' % (k, j), B.pass_sort_step(k, j), [keys], lp, -950 + 30 * (n % 40),
                   850 + 120 * (n // 40))
-    cells0 = pp('WSB_Cells0', B.pass_cells(ref.CW, ref.CH), [keys], (log2(ref.CW), log2(ref.CH)), -650, 1600)
+    def cells(name, W, H, x, y):
+        if not skip:
+            return pp('WSB_Cells' + name, B.pass_cells(W, H), [keys], (log2(W), log2(H)), x, y)
+        starts = pp('WSB_Starts' + name, pass_cell_starts(W, H), [keys], (log2(W), log2(H)), x - 50, y + 50)
+        return pp('WSB_Cells' + name, pass_cells_joined(W, H), [keys, starts], (log2(W), log2(H)), x, y)
+
+    cells0 = cells('0', ref.CW, ref.CH, -650, 1600)
     cellb = pp('WSB_CellBounds', B.pass_cell_bounds(), [keys, cells0, pack_pos], (log2(2 * ref.CW), log2(ref.CH)),
                -500, 1600)
     colxz = pp('WSB_ColXZ', B.pass_columns(True), [cellb, coarse], (log2(2 * Dn), log2(Dn)), -350, 1550)
@@ -1395,16 +1447,17 @@ def build_colour(fast=True, lookup='quadratic', skip=None, lite=False):
     bw, bh = lin_dims(S * R * Dn)
     boxrow = pp('WSB_BoxRow', B.pass_box_row(), [colxz, colxy, slabr, runr], (log2(2 * bw), log2(bh)), 400, 1600)
     boxes = pp('WSB_Boxes', B.pass_boxes(), [boxrow, slabr], boxt, 500, 1600)
-    sortfit = pp('WSB_SortFit', B.pass_fit(lambda: const(float(ref.AW * ref.AH))), [boxes, bounds], one, 600, 1500)
+    sortfit = pp('WSB_SortFit', global_table(B.pass_fit(lambda: const(float(ref.AW * ref.AH))), skip),
+                 [boxes, bounds], one, 600, 1500)
     sortboxes = pp('WSB_SortBoxes', B.pass_grid_table(lambda: frame_a(1).x), [boxes, sortfit], boxt, 700, 1500)
     keys = pp('WSB_Keys1', B.pass_keys1(), [pack_pos, coarse, slabx, runtab, sortboxes, sortfit], lp, 800, 1500)
     for n, (k, j) in enumerate(ref.sort_steps()):
         keys = pp('WSB_Sort1 %d/%d' % (k, j), B.pass_sort_step(k, j), [keys], lp, 900 + 30 * (n % 40),
                   1500 + 120 * (n // 40))
-    cells1 = pp('WSB_Cells1', B.pass_cells(ref.AW, ref.AH), [keys], atl, -650, 600)
+    cells1 = cells('1', ref.AW, ref.AH, -650, 600)
 
     # --- Quality: the voxel grids of the boxes (the finest that fits the budget) and their mips ---
-    voxfit = pp('WSB_VoxFit', B.pass_fit(B.q_budget), [boxes, bounds], one, -1000, 700)
+    voxfit = pp('WSB_VoxFit', global_table(B.pass_fit(B.q_budget), skip), [boxes, bounds], one, -1000, 700)
     voxboxes = pp('WSB_VoxBoxes', B.pass_grid_table(lambda: frame_a(1).x), [boxes, voxfit], boxt, -800, 650)
     voxmap = pp('WSB_VoxMap', B.pass_vox_map(), [voxboxes], atl, -700, 650)
     if not lite:
@@ -1426,12 +1479,13 @@ def build_colour(fast=True, lookup='quadratic', skip=None, lite=False):
                                                                                    1.0)),
                         [keys, pack_normal], lp, -650, 500)
         sorted_vals = pp('WSNB_SortedVals', pass_sorted_copy(), [keys, pack_vals], lp, -650, 150)
-        sortmap = pp('WSB_SortMap', B.pass_vox_map(), [sortboxes], atl, -650, 750)
         near = cells1
-        for axis, name in enumerate('XYZ'):
-            near = pp('WSB_Near%s' % name, B.pass_near(axis, axis == 0), [near, sortmap, sortboxes, voxfit, sortfit],
-                      atl, -620 + 40 * axis, 750)
-        normals = pp('WSNB_Normals', pass_normals(True, skip),
+        if NEAR:
+            sortmap = pp('WSB_SortMap', B.pass_vox_map(), [sortboxes], atl, -650, 750)
+            for axis, name in enumerate('XYZ'):
+                near = pp('WSB_Near%s' % name, B.pass_near(axis, axis == 0),
+                          [near, sortmap, sortboxes, voxfit, sortfit], atl, -620 + 40 * axis, 750)
+        normals = pp('WSNB_Normals', pass_normals(True, skip, NEAR),
                      splat_in + [pack_normal, pack_normal, sorted_pos, sorted_nrm, near], atl, -500, 450, fmt=FMT_16F)
         splat = pp('WSNB_Splat', pass_splat_colour(True, skip),
                    splat_in + [pack_vals, normals, sorted_pos, sorted_vals], atl, -500, 300, fmt=FMT_16F)
@@ -1439,7 +1493,7 @@ def build_colour(fast=True, lookup='quadratic', skip=None, lite=False):
         normals = pp('WSNB_Normals', pass_normals(), splat_in + [pack_normal], atl, -500, 450, fmt=FMT_16F)
         splat = pp('WSNB_Splat', pass_splat_colour(), splat_in + [pack_vals, normals], atl, -500, 300, fmt=FMT_16F)
     V = pp('WSNB_Voxels', pass_voxels(), [splat, normals], atl, -400, 300, fmt=FMT_16F)
-    radius = pp('WSNB_Radius', pass_radius(), [area_total, voxfit, size], one, -400, 700)
+    radius = pp('WSNB_Radius', global_table(pass_radius(), skip), [area_total, voxfit, size], one, -400, 700)
 
     # --- Non-Uniform Blur passes ---
     for k in range(MAX_PASSES):
@@ -1458,7 +1512,7 @@ def build_colour(fast=True, lookup='quadratic', skip=None, lite=False):
     if lookup == 'cubic':
         resolve = pass_resolve_cubic(fast)
     else:
-        resolve = pass_resolve_skip(lookup) if skip else pass_resolve(fast)
+        resolve = pass_resolve_skip() if skip else pass_resolve(fast)
     out = g.pixel_processor('WSNB_Resolve', resolve,
                             [src, position, uvmask, V, voxfit, coarse, slabx, runtab, voxboxes, bmap, radius],
                             None, color=True, fmt=FMT_16, x=-300 + 200 * MAX_PASSES + 200, y=0)
@@ -1483,7 +1537,7 @@ def build_xml(fast=True, lookup=None, skip=None, lite=False):
     (same output, more work); skip (default: as fast) only does the work that is used: inactive
     pass slots, unused mip levels, unblurred texels ... (same output again). lite=True builds
     World Space Non Uniform Blur Lite at the table sizes ref is configured to (see build())."""
-    lookup = lookup or ('linear' if lite else 'quadratic')
+    lookup = lookup or 'quadratic'
     pkg_uid = new_uid()
     colour, n = build_colour(fast, lookup, skip, lite)
     xml = ('<?xml version="1.0" encoding="UTF-8"?><package><identifier v="%s"/><formatVersion v="1.1.0.202302"/>'

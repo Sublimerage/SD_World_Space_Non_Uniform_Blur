@@ -98,6 +98,7 @@ def run(path, sc, out_dir, settings):
         # the mesh-only passes don't depend on the settings (Quality aside): reuse them
         cache = {u: v for u, v in r['_all'].items() if u in nm and BV.group(nm[u], False) == 'mesh'}
         cache_q = prm['quality']
+        r = {'output': r['output']}          # drop the per-stroke tables before the next run
         nodes = [dict(name=nm.get(u, '?'), reads=st['reads'], nodes=st['nodes'], w=st['size'][0], h=st['size'][1],
                       rel=st['rel'], bpp=bpp.get(u, 16)) for u, st in SI.STATS.items()]
         np.save(os.path.join(out_dir, '%s_%s.npy' % (sc, s)), r['output'])

@@ -1,5 +1,6 @@
-"""The speed-ups (build(fast=True), what ships) must change no output pixel, and v2.1's
-stretched-island fix must change nothing on meshes without stretched islands.
+"""The speed-ups (build(fast=True), what ships: the faster passes and skipping the work that
+isn't used) must change no output pixel, and v2.1's stretched-island fix must change nothing
+on meshes without stretched islands.
 
 Builds v2.1 with and without the speed-ups, v2.1 with v2.0's tricubic final lookup
 (lookup='cubic'), and v2.0 as released (from git, when available), at reduced table sizes,
@@ -11,6 +12,15 @@ map off / from the input / inverted, Dither), plus a grayscale input (as in a ma
 must be exactly equal (max |fast - plain| == 0), and v2.1 with v2.0's lookup must equal v2.0
 (only the final lookup changed elsewhere; its mean difference is printed). The fast - plain
 difference maps are saved in a sheet.
+
+The shipping build skips inactive pass slots, mip levels no tap reads, the setup of voxels and
+texels that aren't blurred, the Blur Map read when it isn't used and the dither at Dither 0.
+A second list of cases aims at that: Samples 1 / 2 / 4 / 8 / 16 with Softness 0 / 0.25 / 1,
+Softness values where only some mip levels are read, Intensity small enough that fewer passes
+run than Samples asks for, Intensity 0, the blur map off / from the input / from the Blur Map
+input. On those, the plain graph (no speed-up, nothing skipped) and the shipping one must again
+be exactly equal. Lite is the same graph without Softness and its mip pyramids: built at the
+same sizes with v2.1's final lookup, it must equal v2.1 at Softness 0 exactly.
 
     python3 tools/test_fast_exact.py [out_dir]
 """
@@ -72,6 +82,9 @@ def build_all(config):
         W.build(out[name], fast=fast, lookup=lookup)
     if released_sbs(config, os.path.join(d, 'v20.sbs')) is not None:
         out['v2.0'] = os.path.join(d, 'v20.sbs')
+    # Lite at the same sizes, with v2.1's final lookup: v2.1 at Softness 0 without the mip pyramids
+    out['lite'] = os.path.join(d, 'lite.sbs')
+    W.build(out['lite'], lite=True, config=config)
     return out
 
 
@@ -91,7 +104,7 @@ def scenes():
                 stack=layout_mesh.make_layout(96, 12.0, TV.STACK))
 
 
-def run(path, maps, params, gray=False):
+def run(path, maps, params, gray=False, graph=None):
     mask, pos, uvm = maps
     col, bmap = TV.colour_input(pos, uvm, mask)
     pos4 = np.concatenate([pos, np.ones(pos.shape[:2] + (1,))], -1).astype(np.float32)
@@ -99,7 +112,7 @@ def run(path, maps, params, gray=False):
     prm.update(params)
     imgs = {'input': col[..., 0] if gray else col, 'mesh_position': pos4,
             'mesh_uv_mask': uvm.astype(np.float32), 'blur_map': bmap}
-    out = SI.run_graph(path, W.GRAPH_ID, imgs, prm)['output']   # a grayscale input, as in a mask: read as grey
+    out = SI.run_graph(path, graph or W.GRAPH_ID, imgs, prm)['output']   # a grayscale input, as in a mask: read as grey
     return out[..., 0] if gray else out
 
 
@@ -118,6 +131,29 @@ CASES = [
     ('layout', dict(P, use_blur_map=False, dither=1.0)),
     ('row', P), ('column', P), ('stack', P), ('stack', dict(P, quality=1.0, blades=6.0)),
 ]
+# what the shipping build skips (fast and plain only; Lite too where Softness is 0)
+CASES_SKIP = (
+    [('box', dict(P, samples=float(n), softness=sf)) for n in (1, 2, 4, 8, 16) for sf in (0.0, 0.25, 1.0)
+     if (n, sf) != (4, 0.25)] +
+    # mip levels: none read (the radius is too small for level 1), some, all
+    [('box', dict(P, softness=0.02)), ('box', dict(P, softness=0.1)), ('box', dict(P, softness=0.5)),
+     ('box', dict(P, softness=1.0, intensity=48.0, samples=2.0)),
+     ('sphere', dict(P, softness=0.4, intensity=40.0, samples=8.0)),
+     # fewer passes than Samples: N = min(Samples, ceil(Intensity * pi))
+     ('box', dict(P, intensity=4.0, samples=16.0)), ('box', dict(P, intensity=1.5, samples=8.0, softness=1.0)),
+     ('box', dict(P, intensity=0.5, samples=4.0)), ('box', dict(P, intensity=0.3, samples=16.0, softness=0.0)),
+     ('layout', dict(P, intensity=4.0, samples=16.0, softness=0.0)),
+     ('box', dict(P, intensity=0.0)), ('layout', dict(P, intensity=0.0, dither=1.0)),
+     # blur map off / from the input / from the Blur Map input, with other settings
+     ('box', dict(P, use_blur_map=False, samples=1.0, softness=0.0)),
+     ('box', dict(P, use_blur_map=False, samples=16.0, softness=1.0)),
+     ('sphere', dict(P, use_blur_map=False, samples=8.0)),
+     ('layout', dict(P, use_blur_map=False, softness=0.0, samples=2.0)),
+     ('sphere', dict(P, blur_map_from_input=True, softness=0.0, dither=2.0)),
+     ('stack', dict(P, blur_map_from_input=True, invert_blur_map=True, samples=8.0, softness=1.0)),
+     ('row', dict(P, softness=0.0, samples=16.0, intensity=6.0)), ('column', dict(P, softness=1.0, samples=1.0)),
+     ('box_tiny', dict(P, softness=0.0, samples=8.0)),
+     ('box', dict(P, softness=0.0, gray=True)), ('layout', dict(P, use_blur_map=False, samples=8.0, gray=True))])
 CASES_BIG_SORT = [('box', P), ('box', dict(P, quality=1.0)), ('layout', dict(P, quality=1.0)),
                   ('sphere', dict(P, quality=2.0, softness=0.0)), ('stack', dict(P, quality=1.0))]
 
@@ -126,20 +162,29 @@ def main(out_dir):
     os.makedirs(out_dir, exist_ok=True)
     S = scenes()
     diffs, ok, n = [], True, 0
-    for cname, config, cases in (('small', SMALL, CASES), ('big sort table', BIG_SORT, CASES_BIG_SORT)):
+    lite_n = 0
+    for cname, config, cases in (('small', SMALL, CASES), ('big sort table', BIG_SORT, CASES_BIG_SORT),
+                                 ('skipping', SMALL, CASES_SKIP)):
         paths = build_all(config)
         cases = cases + ([('box', dict(P, gray=True)), ('layout', dict(P, gray=True))] if cname == 'small' else [])
         for scene, prm in cases:
             prm = dict(prm)
             gray = prm.pop('gray', False)
             t0 = time.time()
-            got = {k: run(p, S[scene], prm, gray) for k, p in paths.items()}
+            which = ('fast', 'plain') if cname == 'skipping' else ('fast', 'plain', 'cubic', 'v2.0')
+            got = {k: run(paths[k], S[scene], prm, gray) for k in which if k in paths}
             d = np.abs(got['fast'] - got['plain'])
-            same = d.max() == 0.0
+            same = d.max() == 0.0                       # (a NaN anywhere fails this too)
             rel = ''
+            if prm.get('softness') == 0.0:
+                lite = run(paths['lite'], S[scene], prm, gray, graph=W.LITE_GRAPH_ID)
+                eq = np.abs(lite - got['fast']).max() == 0.0
+                rel += '  Lite == v2.1 at Softness 0: %s' % ('yes' if eq else 'NO')
+                same &= eq
+                lite_n += 1
             if 'v2.0' in got:
                 fix_only = np.abs(got['cubic'] - got['v2.0']).max()
-                rel = '  v2.1 with v2.0 lookup == v2.0: %s  v2.1 vs v2.0 mean %.1e' % (
+                rel += '  v2.1 with v2.0 lookup == v2.0: %s  v2.1 vs v2.0 mean %.1e' % (
                     'yes' if fix_only == 0.0 else 'NO (%.1e)' % fix_only, np.abs(got['fast'] - got['v2.0']).mean())
                 same &= fix_only == 0.0
             changed = np.abs(got['fast'] - run(paths['fast'], S[scene], dict(prm, intensity=0.0), gray)).max()
@@ -155,11 +200,12 @@ def main(out_dir):
     hmax = max(x.shape[0] for x in diffs)
     wmax = max(x.shape[1] for x in diffs)
     tiles = [np.pad(x, ((0, hmax - x.shape[0]), (0, wmax - x.shape[1])), constant_values=0.0) for x in diffs]
-    rows = [np.concatenate(tiles[i:i + 8] + [np.zeros_like(tiles[0])] * (8 - len(tiles[i:i + 8])), 1)
-            for i in range(0, len(tiles), 8)]
+    rows = [np.concatenate(tiles[i:i + 10] + [np.zeros_like(tiles[0])] * (10 - len(tiles[i:i + 10])), 1)
+            for i in range(0, len(tiles), 10)]
     Image.fromarray((np.clip(np.concatenate(rows, 0), 0, 1) * 255).astype(np.uint8)).save(
         os.path.join(out_dir, 'fast_vs_plain_diff.png'))
-    print('%d cases, %s' % (n, 'ALL EQUAL (0 differing pixels)' if ok else 'SOME DIFFER'))
+    print('%d cases (%d of them also with Lite), %s' % (n, lite_n,
+                                                        'ALL EQUAL (0 differing pixels)' if ok else 'SOME DIFFER'))
     print('difference maps:', os.path.join(out_dir, 'fast_vs_plain_diff.png'))
     return ok
 
