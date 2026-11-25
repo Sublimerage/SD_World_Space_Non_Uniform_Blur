@@ -170,7 +170,6 @@ LITE_OUTPUT_NAME = '%s_v%s.sbs' % (LITE_GRAPH_ID, LITE_VERSION)
 LITE_CONFIG = (256, 512, 512, 512, 512, 128, 16, 16, {1: 32, 2: 40, 3: 48, 4: 64}, 64, 4, 32)
 TAGS = 'filter;blur;non uniform;bokeh;world space'
 MAX_PASSES = 16
-NEAR = True
 LEVELS = 5                               # voxel mip levels 0..4 per box (0 = the voxel grid itself)
 C_DECAY = math.sqrt(-math.log(0.001))    # same pass decay as the 2D Non-Uniform Blur
 T_INT = 16
@@ -1479,13 +1478,16 @@ def build_colour(fast=True, lookup='quadratic', skip=None, lite=False):
                                                                                    1.0)),
                         [keys, pack_normal], lp, -650, 500)
         sorted_vals = pp('WSNB_SortedVals', pass_sorted_copy(), [keys, pack_vals], lp, -650, 150)
+        # NearX/Y/Z let voxels with no surface in reach skip the walk. With `skip` a walk step over an
+        # empty cell costs one read, so the walk is cheaper than the four tables that avoid it
+        # (sphere, 2048^2: 0.84 -> 0.75 G reads in total): they are left out, the result is the same.
         near = cells1
-        if NEAR:
+        if not skip:
             sortmap = pp('WSB_SortMap', B.pass_vox_map(), [sortboxes], atl, -650, 750)
             for axis, name in enumerate('XYZ'):
                 near = pp('WSB_Near%s' % name, B.pass_near(axis, axis == 0),
                           [near, sortmap, sortboxes, voxfit, sortfit], atl, -620 + 40 * axis, 750)
-        normals = pp('WSNB_Normals', pass_normals(True, skip, NEAR),
+        normals = pp('WSNB_Normals', pass_normals(True, skip, near=not skip),
                      splat_in + [pack_normal, pack_normal, sorted_pos, sorted_nrm, near], atl, -500, 450, fmt=FMT_16F)
         splat = pp('WSNB_Splat', pass_splat_colour(True, skip),
                    splat_in + [pack_vals, normals, sorted_pos, sorted_vals], atl, -500, 300, fmt=FMT_16F)
