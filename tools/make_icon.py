@@ -12,6 +12,11 @@ transparent background.
 
     python3 tools/make_icon.py                 # docs/icon/world_space_non_uniform_blur{,_512}.png + preview.png
     python3 tools/make_icon.py --options       # computes every OPTIONS entry, writes a comparison sheet
+    python3 tools/make_icon.py --lite          # docs/icon/world_space_non_uniform_blur_lite{,_512}.png + preview_lite.png
+
+--lite: the icon of World Space Non Uniform Blur Lite is the same icon (it reads
+docs/icon/world_space_non_uniform_blur{,_512}.png, so render those first) with a LITE label
+across the bottom, drawn exactly as World Space Curvature Lite's (same font, sizes and colours).
 """
 
 import os
@@ -189,6 +194,41 @@ def sheet(icons_512, icons_128):
     return out
 
 
+# World Space Non Uniform Blur Lite: the same icon with this label, as World Space Curvature Lite
+# (first font found; PIL's own otherwise)
+LITE_TEXT = 'LITE'
+LITE_FONTS = ('/usr/share/fonts/opentype/inter/Inter-ExtraBold.otf', '/usr/share/fonts/opentype/inter/Inter-Bold.otf',
+              '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 'arialbd.ttf', 'Arial Bold.ttf')
+
+
+def lite_label(icon, ss=4):
+    """The icon with a dark rounded label and white LITE across the bottom (drawn at ss x, then reduced)."""
+    from PIL import ImageDraw, ImageFont
+    n = icon.size[0]
+    N = n * ss
+    font = None
+    for f in LITE_FONTS:
+        try:
+            font = ImageFont.truetype(f, int(N * 0.215))
+            break
+        except OSError:
+            pass
+    font = font or ImageFont.load_default(int(N * 0.215))
+    lab = Image.new('RGBA', (N, N), (0, 0, 0, 0))
+    d = ImageDraw.Draw(lab)
+    x0, y0, x1, y1 = d.textbbox((0, 0), LITE_TEXT, font=font)
+    tw, th = x1 - x0, y1 - y0
+    px, py = N * 0.07, N * 0.05
+    w, h = tw + 2 * px, th + 2 * py
+    bx, by = (N - w) / 2, N * 0.985 - h
+    d.rounded_rectangle([bx, by, bx + w, by + h], radius=h * 0.3, fill=(0x1E, 0x1E, 0x20, 242),
+                        outline=(242, 242, 242, 255), width=max(1, int(N * 0.012)))
+    d.text((bx + px - x0, by + py - y0), LITE_TEXT, font=font, fill=(242, 242, 242, 255))
+    out = icon.convert('RGBA').copy()
+    out.alpha_composite(lab.resize((n, n), Image.LANCZOS))
+    return out
+
+
 def cached_texture(name):
     path = os.path.join(OUT_DIR, 'texture_%s.npy' % name)
     if not os.path.exists(path):
@@ -205,6 +245,12 @@ if __name__ == "__main__":
         sheet([render(texs[t], 512, style=st) for t, st in combos],
               [render(texs[t], 128, style=st) for t, st in combos]).save(os.path.join(OUT_DIR, 'options.png'))
         print('wrote docs/icon/options.png:', ', '.join('%s/%s' % c for c in combos))
+    elif '--lite' in sys.argv:
+        ico, big = (lite_label(Image.open(os.path.join(OUT_DIR, ICON_NAME + x + '.png'))) for x in ('', '_512'))
+        ico.save(os.path.join(OUT_DIR, ICON_NAME + '_lite.png'))
+        big.save(os.path.join(OUT_DIR, ICON_NAME + '_lite_512.png'))
+        sheet([big], [ico]).save(os.path.join(OUT_DIR, 'preview_lite.png'))
+        print('wrote docs/icon/%s_lite.png' % ICON_NAME)
     else:
         tex = cached_texture(CHOSEN[0])
         ico, big = render(tex, 128), render(tex, 512)

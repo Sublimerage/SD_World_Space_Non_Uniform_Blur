@@ -1386,16 +1386,17 @@ def graph_xml(g, desc):
     return g.xml(desc).replace('<tags v="filter;mask;blur;world space"/>', '<tags v="%s"/>' % TAGS)
 
 
-def icon_path():
-    return os.path.join(os.path.dirname(HERE), 'docs', 'icon', GRAPH_ID + '.png')
+def icon_path(lite=False):
+    """the graph's icon; Lite's is the same one with a LITE label (tools/make_icon.py --lite)"""
+    return os.path.join(os.path.dirname(HERE), 'docs', 'icon', (LITE_GRAPH_ID if lite else GRAPH_ID) + '.png')
 
 
 def build_colour(fast=True, lookup='quadratic', skip=None, lite=False):
     skip = fast if skip is None else skip
     assert not lite or (fast and skip), 'Lite is built from the fast, skipping passes'
     g = B.Graph(LITE_GRAPH_ID if lite else GRAPH_ID, 'World Space Non Uniform Blur' + (' Lite' if lite else ''))
-    if os.path.exists(icon_path()):
-        g.set_icon(icon_path())
+    if os.path.exists(icon_path(lite)):
+        g.set_icon(icon_path(lite))
     I = inputs(g, True)
     g.paraminputs.append(params_xml(lite))
     src, bmap, position, uvmask = I['input'], I['blur_map'], I['mesh_position'], I['mesh_uv_mask']
